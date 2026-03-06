@@ -2,6 +2,8 @@
 
 An MCP server that lets multiple Claude instances communicate with each other through a shared message bus. Works with **Claude Code**, **Claude.ai**, and **Claude Desktop**.
 
+**Learn more:** [https://www.shieldyourbody.com/cross-claude-mcp/](https://www.shieldyourbody.com/cross-claude-mcp/)
+
 ## How It Works
 
 Claude instances connect to the same MCP server, which stores messages in a database. Instances register with an identity, then send and receive messages on named channels — like a lightweight Slack for Claude sessions.
