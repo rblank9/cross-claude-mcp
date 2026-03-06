@@ -85,7 +85,7 @@ async function runTests() {
       const req = jsonRpcRequest(method, params);
       pending.set(req.id, () => resolve(responses.get(req.id)));
       server.stdin.write(JSON.stringify(req) + "\n");
-      setTimeout(() => reject(new Error(`Timeout waiting for response to ${method}`)), 5000);
+      setTimeout(() => reject(new Error(`Timeout waiting for response to ${method}`)), 15000);
     });
   }
 
@@ -115,6 +115,7 @@ async function runTests() {
     assert(toolNames.includes("list_instances"), "Has list_instances tool");
     assert(toolNames.includes("search_messages"), "Has search_messages tool");
     assert(toolNames.includes("get_replies"), "Has get_replies tool");
+    assert(toolNames.includes("wait_for_reply"), "Has wait_for_reply tool");
     console.log(`   Tools found: ${toolNames.join(", ")}`);
 
     // 3. Register instance
@@ -250,6 +251,83 @@ async function runTests() {
     const unreadText = unreadResp.result.content[0].text;
     assert(unreadText.includes("Sure Alice"), "Shows Bob's message to Alice");
     assert(!unreadText.includes("Hello Bob! Can you review"), "Filters out Alice's own messages");
+
+    // 14. wait_for_reply — message already exists
+    console.log("\n14. wait_for_reply (message already waiting)");
+    // Send a message from bob, then alice waits for it
+    await send("tools/call", {
+      name: "send_message",
+      arguments: {
+        channel: "general",
+        sender: "test-bob",
+        content: "Here are my review notes.",
+        message_type: "response",
+      },
+    });
+
+    // Get current last message id for after_id
+    const checkForId = await send("tools/call", {
+      name: "check_messages",
+      arguments: { channel: "general", limit: 1 },
+    });
+    const lastIdMatch = checkForId.result.content[0].text.match(/Last message ID: (\d+)/);
+    const beforeBobMsg = parseInt(lastIdMatch[1]) - 1; // One before bob's message
+
+    const waitResp = await send("tools/call", {
+      name: "wait_for_reply",
+      arguments: {
+        channel: "general",
+        after_id: beforeBobMsg,
+        instance_id: "test-alice",
+        timeout_seconds: 5,
+        poll_interval_seconds: 1,
+      },
+    });
+    const waitText = waitResp.result.content[0].text;
+    assert(waitText.includes("review notes"), "wait_for_reply returns existing message");
+
+    // 15. wait_for_reply — timeout when no messages
+    console.log("\n15. wait_for_reply (timeout)");
+    const currentLastId = parseInt(waitText.match(/Last message ID: (\d+)/)[1]);
+    const timeoutResp = await send("tools/call", {
+      name: "wait_for_reply",
+      arguments: {
+        channel: "general",
+        after_id: currentLastId,
+        instance_id: "test-alice",
+        timeout_seconds: 2,
+        poll_interval_seconds: 1,
+      },
+    });
+    assert(timeoutResp.result.content[0].text.includes("No new messages"), "Timeout returns appropriate message");
+
+    // 16. done message type
+    console.log("\n16. Done message type");
+    const doneMsg = await send("tools/call", {
+      name: "send_message",
+      arguments: {
+        channel: "general",
+        sender: "test-bob",
+        content: "Review complete, no more feedback.",
+        message_type: "done",
+      },
+    });
+    assert(doneMsg.result.content[0].text.includes("[done]"), "Done message sent");
+
+    // wait_for_reply should see the done signal
+    const waitDone = await send("tools/call", {
+      name: "wait_for_reply",
+      arguments: {
+        channel: "general",
+        after_id: currentLastId,
+        instance_id: "test-alice",
+        timeout_seconds: 5,
+        poll_interval_seconds: 1,
+      },
+    });
+    const waitDoneText = waitDone.result.content[0].text;
+    assert(waitDoneText.includes("DONE"), "wait_for_reply detects done signal");
+    assert(waitDoneText.includes("Review complete"), "Done message content visible");
 
     console.log(`\n${"=".repeat(40)}`);
     console.log(`Results: ${passed} passed, ${failed} failed`);

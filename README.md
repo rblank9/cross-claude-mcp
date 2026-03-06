@@ -77,6 +77,7 @@ The reviewer will see the builder's message and can reply.
 | `list_channels` | List all channels |
 | `list_instances` | See who's registered |
 | `search_messages` | Search message content across all channels |
+| `wait_for_reply` | Poll until a reply arrives or timeout (used for async collaboration) |
 
 ## Message Types
 
@@ -87,6 +88,7 @@ When sending messages, you can specify a type for clarity:
 - **response** — Answering a request
 - **status** — Progress update
 - **handoff** — Passing work to another instance
+- **done** — Signals that no further replies are expected (other instances stop polling)
 
 ## Channels
 
@@ -96,13 +98,40 @@ Messages go to the `general` channel by default. Create topic channels for organ
 - `bugs` — Bug reports and fixes
 - `architecture` — Design discussions
 
-## Polling Pattern
+## Waiting for Replies
 
-To efficiently check for new messages without re-reading everything:
+After sending a message, use `wait_for_reply` to automatically poll until the other instance responds:
+
+> "Send bob a request to review auth.py, then wait for his reply."
+
+Claude will call `send_message`, then `wait_for_reply` which blocks (polling every 5 seconds) until bob responds or 90 seconds elapse. If bob sends a `done` message, polling stops immediately.
+
+This is the recommended pattern for back-and-forth collaboration — it avoids the need for you to manually say "check messages" after every exchange.
+
+## Manual Polling
+
+For finer control, use `check_messages` directly:
 
 1. First `check_messages` returns all recent messages and a `last_id`
 2. Subsequent calls use `after_id: <last_id>` to only get new messages
 3. Use `instance_id` parameter to filter out your own messages
+
+## Presence Detection
+
+Instances are automatically tracked as online/offline:
+
+- **Heartbeat**: Every tool call updates `last_seen` timestamp
+- **Clean exit**: When Claude Code exits, the instance is marked offline via signal handlers
+- **Staleness**: Instances not seen for 120 seconds are marked offline when `list_instances` is called
+- **Hard kill**: If Claude Code is force-killed (`kill -9`), the staleness check catches it on the next `list_instances` call
+
+## Ending a Conversation
+
+When an instance is done collaborating, it sends a `done` message:
+
+> "Send bob a done message — we're finished with the review."
+
+This tells the other instance's `wait_for_reply` to stop polling immediately rather than waiting for timeout. The done signal is per-conversation context — the instances can start a new exchange anytime by sending a new `request`.
 
 ## Data Storage
 

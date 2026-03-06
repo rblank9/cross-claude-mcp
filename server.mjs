@@ -206,9 +206,9 @@ server.tool(
     sender: z.string().describe("Your instance_id"),
     content: z.string().describe("The message content"),
     message_type: z
-      .enum(["message", "request", "response", "status", "handoff"])
+      .enum(["message", "request", "response", "status", "handoff", "done"])
       .default("message")
-      .describe("Type of message: message (general), request (asking for something), response (answering), status (progress update), handoff (passing work)"),
+      .describe("Type of message: message (general), request (asking for something), response (answering), status (progress update), handoff (passing work), done (signals no more replies expected - other instances stop polling)"),
     in_reply_to: z.number().optional().describe("Message ID this is replying to"),
   },
   async ({ channel, sender, content, message_type, in_reply_to }) => {
@@ -378,6 +378,63 @@ server.tool(
 
     return {
       content: [{ type: "text", text: `${messages.length} result(s) for "${query}":\n\n${formatted}` }],
+    };
+  }
+);
+
+// Tool: Wait for a reply (polling loop)
+server.tool(
+  "wait_for_reply",
+  "Poll a channel until a new message arrives from another instance, or until timeout. Use this after sending a message to wait for a response. Stops early if a 'done' message is received.",
+  {
+    channel: z.string().default("general").describe("Channel to poll"),
+    after_id: z.number().describe("Only look for messages after this ID (use the ID from your last send_message)"),
+    instance_id: z.string().describe("Your instance_id (to filter out your own messages)"),
+    timeout_seconds: z.number().default(90).describe("Max seconds to wait before giving up (default: 90)"),
+    poll_interval_seconds: z.number().default(5).describe("Seconds between polls (default: 5)"),
+  },
+  async ({ channel, after_id, instance_id, timeout_seconds, poll_interval_seconds }) => {
+    const deadline = Date.now() + timeout_seconds * 1000;
+    let lastCheckedId = after_id;
+
+    while (Date.now() < deadline) {
+      touchHeartbeat();
+
+      const messages = stmts.getUnread.all(channel, lastCheckedId, instance_id);
+
+      if (messages.length > 0) {
+        const hasDone = messages.some((m) => m.message_type === "done");
+
+        const formatted = messages
+          .map(
+            (m) =>
+              `#${m.id} [${m.message_type}] ${m.sender} (${m.created_at})${m.in_reply_to ? ` (reply to #${m.in_reply_to})` : ""}:\n${m.content}`
+          )
+          .join("\n\n---\n\n");
+
+        const lastId = messages[messages.length - 1].id;
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${messages.length} new message(s) in #${channel}:\n\n${formatted}\n\n---\nLast message ID: ${lastId}${hasDone ? "\n\nThe other instance signaled DONE — no further replies expected." : ""}`,
+            },
+          ],
+        };
+      }
+
+      // Sleep before next poll
+      await new Promise((resolve) => setTimeout(resolve, poll_interval_seconds * 1000));
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `No new messages in #${channel} after waiting ${timeout_seconds}s. The other instance may be busy or offline. You can try again or check list_instances.`,
+        },
+      ],
     };
   }
 );
