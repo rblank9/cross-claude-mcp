@@ -307,7 +307,8 @@ async function startHTTP(db) {
 
     if (API_TOKEN) {
       const authHeader = req.headers.authorization || "";
-      const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+      const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7)
+        : req.query.api_key || null;
       if (!token || token !== API_TOKEN) {
         return res.status(401).json({ error: "Unauthorized" });
       }
