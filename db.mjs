@@ -26,6 +26,14 @@ const SCHEMA_SQL = `
     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     status TEXT DEFAULT 'online'
   );
+
+  CREATE TABLE IF NOT EXISTS shared_data (
+    key TEXT PRIMARY KEY,
+    content TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    description TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
 `;
 
 const INDEX_SQL = `
@@ -139,6 +147,32 @@ class SqliteDB {
       `SELECT m.*, (SELECT COUNT(*) FROM messages r WHERE r.in_reply_to = m.id) as reply_count
        FROM messages m WHERE m.content LIKE ? ORDER BY m.created_at DESC LIMIT ?`
     ).all(`%${query}%`, limit);
+  }
+
+  shareData(key, content, createdBy, description) {
+    this.db.prepare(
+      `INSERT INTO shared_data (key, content, created_by, description, created_at)
+       VALUES (?, ?, ?, ?, datetime('now'))
+       ON CONFLICT(key) DO UPDATE SET
+         content = excluded.content,
+         created_by = excluded.created_by,
+         description = excluded.description,
+         created_at = datetime('now')`
+    ).run(key, content, createdBy, description);
+  }
+
+  getSharedData(key) {
+    return this.db.prepare(`SELECT * FROM shared_data WHERE key = ?`).get(key);
+  }
+
+  listSharedData() {
+    return this.db.prepare(
+      `SELECT key, created_by, description, length(content) as size_bytes, created_at FROM shared_data ORDER BY created_at DESC`
+    ).all();
+  }
+
+  deleteSharedData(key) {
+    this.db.prepare(`DELETE FROM shared_data WHERE key = ?`).run(key);
   }
 }
 
@@ -263,6 +297,35 @@ class PostgresDB {
       [`%${query}%`, limit]
     );
     return result.rows;
+  }
+
+  async shareData(key, content, createdBy, description) {
+    await this.pool.query(
+      `INSERT INTO shared_data (key, content, created_by, description)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT(key) DO UPDATE SET
+         content = EXCLUDED.content,
+         created_by = EXCLUDED.created_by,
+         description = EXCLUDED.description,
+         created_at = NOW()`,
+      [key, content, createdBy, description]
+    );
+  }
+
+  async getSharedData(key) {
+    const result = await this.pool.query(`SELECT * FROM shared_data WHERE key = $1`, [key]);
+    return result.rows[0] || null;
+  }
+
+  async listSharedData() {
+    const result = await this.pool.query(
+      `SELECT key, created_by, description, length(content) as size_bytes, created_at FROM shared_data ORDER BY created_at DESC`
+    );
+    return result.rows;
+  }
+
+  async deleteSharedData(key) {
+    await this.pool.query(`DELETE FROM shared_data WHERE key = $1`, [key]);
   }
 }
 

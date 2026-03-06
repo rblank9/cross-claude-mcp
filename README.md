@@ -147,6 +147,21 @@ The reviewer will see the builder's message and can reply.
 | `list_channels` | List all channels |
 | `list_instances` | See who's registered |
 | `search_messages` | Search message content across all channels |
+| `share_data` | Store large data (tables, plans, analysis) for other instances to retrieve by key |
+| `get_shared_data` | Retrieve shared data by key |
+| `list_shared_data` | List all shared data keys with sizes and descriptions |
+
+## Sharing Large Data
+
+Instead of cramming huge tables or plans into messages, use the shared data store:
+
+**Sender** (e.g., SEO Claude):
+> "Share the cannibalization analysis via cross-claude with key 'cannibal-q1'. Then send a message to content-claude telling them it's ready."
+
+**Receiver** (e.g., Content Claude):
+> "Check cross-claude messages. Then retrieve the shared data they mentioned."
+
+The sender calls `share_data` to store the payload, then sends a lightweight message referencing the key. The receiver calls `get_shared_data` to pull it on demand. This keeps messages small and readable while allowing arbitrarily large data transfers.
 
 ## Message Types
 
@@ -194,6 +209,28 @@ Claude will call `send_message`, then `wait_for_reply` which blocks (polling eve
 ```bash
 cd cross-claude-mcp
 npm test
+```
+
+## Recommended CLAUDE.md Instructions
+
+After installing, add the following to your `CLAUDE.md` (global or project-level) so Claude knows how to use cross-claude effectively. Copy this block as-is:
+
+```markdown
+### Cross-Claude MCP — Inter-Instance Communication
+
+The **cross-claude** MCP server lets multiple Claude instances communicate via a shared message bus.
+
+**Tools**: `register`, `send_message`, `check_messages`, `wait_for_reply`, `get_replies`, `create_channel`, `list_channels`, `list_instances`, `search_messages`, `share_data`, `get_shared_data`, `list_shared_data`
+
+**Collaboration protocol** (follow when collaborating with another instance):
+- Register first with `register` — pick a unique instance_id (e.g., 'builder', 'reviewer', 'seo-lead')
+- After sending a `request` or `message` that expects a reply, call `wait_for_reply` to poll until the other instance responds (default: 90s timeout, 5s interval)
+- When a `done` message is received, stop polling — the other instance has signaled no more replies
+- For long-running tasks (>30 seconds), send periodic `status` messages so the other instance knows you're still working
+- For large data (tables, plans, analysis >500 chars), use `share_data` to store it by key, then send a short message referencing the key — don't pack huge payloads into messages
+- When your part of a conversation is finished, send a `done` message so the other instance stops polling
+- Use descriptive `message_type` values: `request` (asking), `response` (answering), `handoff` (passing work), `status` (progress), `done` (finished)
+- Keep your `instance_id` consistent within a session
 ```
 
 ## Architecture

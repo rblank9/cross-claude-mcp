@@ -210,6 +210,59 @@ function registerTools(server, db) {
     }
   );
 
+  // --- Shared Data tools (for large payloads) ---
+
+  server.tool(
+    "share_data",
+    "Store large data (tables, plans, analysis) in a shared store instead of packing it into a message. Other instances can retrieve it by key. Use this for anything over ~500 chars.",
+    {
+      key: z.string().describe("Unique key for this data (e.g., 'cannibal-analysis', 'faraday-plan')"),
+      content: z.string().describe("The data content to share"),
+      sender: z.string().describe("Your instance_id"),
+      description: z.string().optional().describe("Brief description of what this data is"),
+    },
+    async ({ key, content, sender, description }) => {
+      touchHeartbeat();
+      await db.shareData(key, content, sender, description || null);
+      const sizeKb = (Buffer.byteLength(content) / 1024).toFixed(1);
+      return {
+        content: [{ type: "text", text: `Shared data stored as "${key}" (${sizeKb} KB). Other instances can retrieve it with get_shared_data.` }],
+      };
+    }
+  );
+
+  server.tool(
+    "get_shared_data",
+    "Retrieve data that another instance shared via share_data.",
+    {
+      key: z.string().describe("The key of the shared data to retrieve"),
+    },
+    async ({ key }) => {
+      touchHeartbeat();
+      const data = await db.getSharedData(key);
+      if (!data) return { content: [{ type: "text", text: `No shared data found for key "${key}". Use list_shared_data to see available keys.` }] };
+      return {
+        content: [{ type: "text", text: `Shared data "${key}" (by ${data.created_by}, ${data.created_at})${data.description ? ` — ${data.description}` : ""}:\n\n${data.content}` }],
+      };
+    }
+  );
+
+  server.tool(
+    "list_shared_data",
+    "List all shared data keys with their descriptions and sizes.",
+    {},
+    async () => {
+      touchHeartbeat();
+      const items = await db.listSharedData();
+      if (items.length === 0) return { content: [{ type: "text", text: "No shared data stored yet." }] };
+      const formatted = items.map((d) => {
+        const sizeKb = (Number(d.size_bytes) / 1024).toFixed(1);
+        return `"${d.key}" (${sizeKb} KB, by ${d.created_by}, ${d.created_at})${d.description ? ` — ${d.description}` : ""}`;
+      }).join("\n");
+      return { content: [{ type: "text", text: `Shared data:\n${formatted}` }] };
+    }
+  );
+
   // Return cleanup function for shutdown
   return () => {
     if (currentInstanceId) {

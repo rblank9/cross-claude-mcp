@@ -116,6 +116,9 @@ async function runTests() {
     assert(toolNames.includes("search_messages"), "Has search_messages tool");
     assert(toolNames.includes("get_replies"), "Has get_replies tool");
     assert(toolNames.includes("wait_for_reply"), "Has wait_for_reply tool");
+    assert(toolNames.includes("share_data"), "Has share_data tool");
+    assert(toolNames.includes("get_shared_data"), "Has get_shared_data tool");
+    assert(toolNames.includes("list_shared_data"), "Has list_shared_data tool");
     console.log(`   Tools found: ${toolNames.join(", ")}`);
 
     // 3. Register instance
@@ -328,6 +331,44 @@ async function runTests() {
     const waitDoneText = waitDone.result.content[0].text;
     assert(waitDoneText.includes("DONE"), "wait_for_reply detects done signal");
     assert(waitDoneText.includes("Review complete"), "Done message content visible");
+
+    // 17. Shared data
+    console.log("\n17. Shared data store");
+    const shareResp = await send("tools/call", {
+      name: "share_data",
+      arguments: {
+        key: "cannibal-analysis",
+        content: "| Page | Keyword | Overlap |\n|------|---------|--------|\n| /emf | emf protection | 85% |\n| /5g | emf protection | 72% |",
+        sender: "test-alice",
+        description: "Keyword cannibalization analysis",
+      },
+    });
+    assert(shareResp.result.content[0].text.includes("cannibal-analysis"), "Shared data stored");
+
+    // List shared data
+    const listShared = await send("tools/call", {
+      name: "list_shared_data",
+      arguments: {},
+    });
+    const sharedListText = listShared.result.content[0].text;
+    assert(sharedListText.includes("cannibal-analysis"), "Shared data appears in list");
+    assert(sharedListText.includes("Keyword cannibalization"), "Description shown in list");
+
+    // Retrieve shared data
+    const getShared = await send("tools/call", {
+      name: "get_shared_data",
+      arguments: { key: "cannibal-analysis" },
+    });
+    const getSharedText = getShared.result.content[0].text;
+    assert(getSharedText.includes("emf protection"), "Shared data content retrieved");
+    assert(getSharedText.includes("85%"), "Shared data table intact");
+
+    // Get non-existent key
+    const getMissing = await send("tools/call", {
+      name: "get_shared_data",
+      arguments: { key: "nonexistent" },
+    });
+    assert(getMissing.result.content[0].text.includes("No shared data found"), "Missing key handled gracefully");
 
     console.log(`\n${"=".repeat(40)}`);
     console.log(`Results: ${passed} passed, ${failed} failed`);
