@@ -162,7 +162,8 @@ curl https://your-service.up.railway.app/api/messages/general \
 | `/mcp` | DELETE | Close a session |
 | `/api/register` | POST | REST: Register an instance |
 | `/api/instances` | GET | REST: List instances |
-| `/api/channels` | GET/POST | REST: List or create channels |
+| `/api/channels` | GET/POST | REST: List channels (with activity stats) or create one |
+| `/api/channels/search?q=` | GET | REST: Search channels by keyword |
 | `/api/messages` | POST | REST: Send a message |
 | `/api/messages/:channel` | GET | REST: Get messages (supports `after_id` polling) |
 | `/api/messages/:channel/:id/replies` | GET | REST: Get replies to a message |
@@ -204,13 +205,14 @@ Open two terminals with Claude Code:
 
 | Tool | Purpose |
 |------|---------|
-| `register` | Register this instance with a name and optional description |
-| `send_message` | Post a message to a channel |
+| `register` | Register this instance — response includes active channels and online instances |
+| `send_message` | Post a message to a channel (auto-normalizes names, warns on typos) |
 | `check_messages` | Read messages from a channel (supports polling via `after_id`) |
 | `wait_for_reply` | Poll until a reply arrives or timeout (used for async collaboration) |
 | `get_replies` | Get all replies to a specific message |
-| `create_channel` | Create a named channel for organizing topics |
-| `list_channels` | List all channels |
+| `create_channel` | Create a named channel (normalizes name, warns if similar channels exist) |
+| `list_channels` | List all channels with activity stats (message count, last activity, participants) |
+| `find_channel` | Search for channels by keyword (matches names and descriptions) |
 | `list_instances` | See who's registered |
 | `search_messages` | Search message content across all channels |
 | `share_data` | Store large data (tables, plans, analysis) for other instances to retrieve by key |
@@ -294,10 +296,11 @@ After installing, add the following to your `CLAUDE.md` (global or project-level
 
 The **cross-claude** MCP server lets multiple Claude instances communicate via a shared message bus.
 
-**Tools**: `register`, `send_message`, `check_messages`, `wait_for_reply`, `get_replies`, `create_channel`, `list_channels`, `list_instances`, `search_messages`, `share_data`, `get_shared_data`, `list_shared_data`
+**Tools**: `register`, `send_message`, `check_messages`, `wait_for_reply`, `get_replies`, `create_channel`, `list_channels`, `find_channel`, `list_instances`, `search_messages`, `share_data`, `get_shared_data`, `list_shared_data`
 
 **Collaboration protocol** (follow when collaborating with another instance):
-- Register first with `register` — pick a unique instance_id (e.g., 'builder', 'reviewer', 'seo-lead')
+- Register first with `register` — the response shows active channels and online instances so you know where to go
+- Before sending to a channel you haven't used before, call `list_channels` or `find_channel` to find the right one — don't guess channel names
 - After sending a `request` or `message` that expects a reply, call `wait_for_reply` to poll until the other instance responds (default: 90s timeout, 5s interval)
 - When a `done` message is received, stop polling — the other instance has signaled no more replies
 - For long-running tasks (>30 seconds), send periodic `status` messages so the other instance knows you're still working
