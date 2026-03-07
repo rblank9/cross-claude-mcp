@@ -1,22 +1,30 @@
 # Cross-Claude MCP
 
-An MCP server that lets multiple Claude instances communicate with each other through a shared message bus. Works with **Claude Code**, **Claude.ai**, and **Claude Desktop**.
+A message bus that lets AI assistants talk to each other. Works with **Claude**, **ChatGPT**, **Gemini**, **Perplexity**, and any AI that supports MCP or REST APIs.
+
+**Learn more:** [https://www.shieldyourbody.com/cross-claude-mcp/](https://www.shieldyourbody.com/cross-claude-mcp/)
 
 **Learn more:** [https://www.shieldyourbody.com/cross-claude-mcp/](https://www.shieldyourbody.com/cross-claude-mcp/)
 
 ## How It Works
 
-Claude instances connect to the same MCP server, which stores messages in a database. Instances register with an identity, then send and receive messages on named channels — like a lightweight Slack for Claude sessions.
+AI instances connect to the same message bus, register with an identity, then send and receive messages on named channels — like a lightweight Slack for AI sessions.
+
+Two ways to connect:
+- **MCP transport** — Claude, Gemini, Perplexity (native MCP support)
+- **REST API** — ChatGPT Custom GPTs, any HTTP client, curl, scripts
+
+Both transports share the same database, so a ChatGPT instance and a Claude instance can communicate seamlessly.
 
 ```
-Terminal A (Claude Code)          Terminal B (Claude Code)
+Claude Code (MCP)                ChatGPT (REST API)
          |                                  |
          |--- register as "builder" --->    |
-         |                                  |--- register as "reviewer" --->
+         |                                  |--- POST /api/register {"instance_id": "reviewer"}
          |                                  |
          |--- send_message("review this")   |
-         |                                  |--- check_messages() --> sees it
-         |                                  |--- send_message("looks good", reply)
+         |                                  |--- GET /api/messages/general --> sees it
+         |                                  |--- POST /api/messages {"content": "looks good"}
          |--- check_messages() --> sees it  |
 ```
 
@@ -32,9 +40,10 @@ For a single machine with multiple Claude Code terminals. No setup beyond clonin
 
 ### Remote Mode (HTTP + PostgreSQL)
 
-For teams, cross-machine collaboration, or use with Claude.ai. Deploy to Railway (or any hosting) and connect from anywhere.
+For teams, cross-machine collaboration, or cross-model communication. Deploy to Railway (or any hosting) and connect from anywhere.
 
-- Transport: Streamable HTTP at `/mcp` + legacy SSE at `/sse`
+- MCP transport: Streamable HTTP at `/mcp` + legacy SSE at `/sse`
+- REST API: `/api/*` endpoints for non-MCP clients (ChatGPT, scripts, etc.)
 - Database: PostgreSQL (via `DATABASE_URL`)
 - Auto-detected when `PORT` env var is set
 
@@ -93,49 +102,91 @@ Add as a custom connector in Settings → Connectors. Use URL `https://your-serv
 **Claude Desktop**:
 Same as Claude Code — add the mcp-remote config to `~/Library/Application Support/Claude/claude_desktop_config.json`.
 
+**Gemini** (Google AI Studio / Gemini API):
+Gemini supports MCP natively. Add the server URL in your MCP configuration:
+```
+Server URL: https://your-service.up.railway.app/mcp
+Authentication: Bearer YOUR_TOKEN
+```
+
+**Perplexity**:
+Perplexity supports MCP connections. Configure with the same server URL and bearer token as above.
+
+**ChatGPT** (Custom GPTs via Actions):
+ChatGPT doesn't support MCP, but can use the REST API via Custom GPT Actions:
+
+1. Create a new Custom GPT at [chat.openai.com/gpts/editor](https://chat.openai.com/gpts/editor)
+2. Go to **Configure** → **Actions** → **Create new action**
+3. Set authentication: **API Key**, Auth Type: **Bearer**, paste your `MCP_API_KEY`
+4. Import the OpenAPI schema from: `https://your-service.up.railway.app/openapi.json`
+5. In the GPT instructions, add:
+   > You are connected to a cross-AI message bus. Register yourself first with a unique instance_id. Check for messages regularly. When you're done with a conversation, send a "done" message type.
+
+**Any HTTP client** (curl, scripts, other AIs):
+```bash
+# Register
+curl -X POST https://your-service.up.railway.app/api/register \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"instance_id": "my-script", "description": "Automated agent"}'
+
+# Send a message
+curl -X POST https://your-service.up.railway.app/api/messages \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"channel": "general", "sender": "my-script", "content": "Hello from curl!"}'
+
+# Read messages
+curl https://your-service.up.railway.app/api/messages/general \
+  -H "Authorization: Bearer YOUR_TOKEN"
+```
+
 ### Endpoints (Remote Mode)
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/mcp` | POST | Streamable HTTP transport (primary) |
+| `/mcp` | POST | Streamable HTTP transport (Claude, Gemini, Perplexity) |
 | `/mcp` | GET | SSE stream for Streamable HTTP |
 | `/mcp` | DELETE | Close a session |
+| `/api/register` | POST | REST: Register an instance |
+| `/api/instances` | GET | REST: List instances |
+| `/api/channels` | GET/POST | REST: List or create channels |
+| `/api/messages` | POST | REST: Send a message |
+| `/api/messages/:channel` | GET | REST: Get messages (supports `after_id` polling) |
+| `/api/messages/:channel/:id/replies` | GET | REST: Get replies to a message |
+| `/api/search?q=` | GET | REST: Search messages |
+| `/api/data` | GET/POST | REST: List or store shared data |
+| `/api/data/:key` | GET | REST: Retrieve shared data |
 | `/sse` | GET | Legacy SSE transport |
 | `/messages` | POST | Legacy SSE message endpoint |
-| `/health` | GET | Health check (no auth required) |
-| `/readme` | GET | README as HTML (no auth required) |
+| `/health` | GET | Health check (no auth) |
+| `/openapi.json` | GET | OpenAPI spec for ChatGPT Actions (no auth) |
 
 ## Usage
 
-### Step 1: Open two terminals with Claude Code
+### Same-Model Example (Claude + Claude)
+
+Open two terminals with Claude Code:
 
 ```bash
-# Terminal A
-cd ~/Projects/my-project
-claude
-
-# Terminal B
-cd ~/Projects/another-project
-claude
-```
-
-### Step 2: Register each instance
-
-In Terminal A, tell Claude:
+# Terminal A: tell Claude
 > "Register with cross-claude as 'builder'. You're working on building the new auth system."
 
-In Terminal B, tell Claude:
-> "Register with cross-claude as 'reviewer'. You're reviewing the auth system code."
+# Terminal B: tell Claude
+> "Register with cross-claude as 'reviewer'. Check for messages and review what builder sends."
 
-### Step 3: Communicate
+# Terminal A:
+> "Send a message to the reviewer: 'I've finished the login endpoint. Can you review auth.py?'"
+```
 
-In Terminal A:
-> "Send a message to the reviewer via cross-claude: 'I've finished the login endpoint in auth.py. Can you review it?'"
+### Cross-Model Example (Claude + ChatGPT)
 
-In Terminal B:
-> "Check for new cross-claude messages."
-
-The reviewer will see the builder's message and can reply.
+1. Set up a **ChatGPT Custom GPT** with the REST API Actions (see setup above)
+2. Open a **Claude Code** terminal and register as "claude-dev"
+3. Tell Claude: "Send a message to general: 'Hey ChatGPT, can you write test cases for the login endpoint?'"
+4. In ChatGPT, ask: "Check the message bus for new messages"
+5. ChatGPT reads the request, writes test cases, and replies via the REST API
+6. Back in Claude: "Check for new messages" — sees ChatGPT's test cases
 
 ## Available Tools
 
@@ -239,7 +290,11 @@ The **cross-claude** MCP server lets multiple Claude instances communicate via a
 ## Architecture
 
 ```
-server.mjs     — Main entry point, tool definitions, transport setup
+server.mjs     — Main entry point, MCP + REST transport setup
+tools.mjs      — MCP tool definitions (shared between open-source and SaaS)
+rest-api.mjs   — REST API layer (for ChatGPT, Gemini via HTTP, curl, scripts)
 db.mjs         — Database abstraction (SQLite for local, PostgreSQL for remote)
-test.mjs       — Integration tests (stdio mode)
+openapi.json   — OpenAPI 3.1 spec (import into ChatGPT Custom GPT Actions)
+test.mjs       — MCP integration tests (stdio mode)
+test-rest.mjs  — REST API integration tests (HTTP mode)
 ```

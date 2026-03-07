@@ -90,8 +90,8 @@ class SqliteDB {
     this.db.prepare(
       `UPDATE instances SET status = 'offline'
        WHERE status = 'online'
-         AND last_seen < datetime('now', '-${thresholdSeconds} seconds')`
-    ).run();
+         AND last_seen < datetime('now', '-' || ? || ' seconds')`
+    ).run(thresholdSeconds);
   }
 
   createChannel(name, description) {
