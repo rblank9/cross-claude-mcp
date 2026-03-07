@@ -362,10 +362,19 @@ li{margin:4px 0}</style></head>
     // Stripe webhook MUST be registered before express.json() / urlencoded
     app.post("/api/billing/webhook", express.raw({ type: "application/json" }), createWebhookHandler(db));
 
-    // Session middleware (needs body parsers for forms)
+    // Session + CSRF middleware (skip for MCP/API paths — they use Bearer token auth)
+    const sessionMw = createSessionMiddleware(db.pool);
+    const MCP_SKIP_PATHS = ["/mcp", "/sse", "/messages"];
+
     app.use(express.urlencoded({ extended: true }));
-    app.use(createSessionMiddleware(db.pool));
-    app.use(validateCsrf);
+    app.use((req, res, next) => {
+      if (MCP_SKIP_PATHS.includes(req.path)) return next();
+      sessionMw(req, res, next);
+    });
+    app.use((req, res, next) => {
+      if (MCP_SKIP_PATHS.includes(req.path)) return next();
+      validateCsrf(req, res, next);
+    });
 
     // Mount web UI routes
     app.use(createDashboardRouter(db));
