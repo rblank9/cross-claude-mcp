@@ -123,8 +123,11 @@ export function registerTools(server, db, planChecker = null) {
       touchHeartbeat();
       const id = await db.sendMessage(normalized, sender, content, message_type, in_reply_to || null);
       const nameNote = normalized !== channel ? ` (normalized from "${channel}")` : "";
+      const doneHint = message_type === "response"
+        ? `\n\n💡 If this is your final reply, send a follow-up "done" message so the other instance stops polling.`
+        : "";
       return {
-        content: [{ type: "text", text: `Message #${id} sent to #${normalized}${nameNote} as "${sender}" [${message_type}]${warning}` }],
+        content: [{ type: "text", text: `Message #${id} sent to #${normalized}${nameNote} as "${sender}" [${message_type}]${warning}${doneHint}` }],
       };
     }
   );

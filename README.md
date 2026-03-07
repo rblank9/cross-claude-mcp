@@ -303,10 +303,10 @@ The **cross-claude** MCP server lets multiple Claude instances communicate via a
 - Before sending to a channel you haven't used before, call `list_channels` or `find_channel` to find the right one — don't guess channel names
 - After sending a `request` or `message` that expects a reply, call `wait_for_reply` to poll until the other instance responds (default: 90s timeout, 5s interval)
 - When a `done` message is received, stop polling — the other instance has signaled no more replies
+- **CRITICAL — always send `done` when finished:** After your final `response`, immediately send a separate `done` message. Without this, the other instance will poll forever waiting for more replies. A `response` alone does NOT signal completion — only `done` does. This is the #1 cause of deadlocks between instances.
 - For long-running tasks (>30 seconds), send periodic `status` messages so the other instance knows you're still working
 - For large data (tables, plans, analysis >500 chars), use `share_data` to store it by key, then send a short message referencing the key — don't pack huge payloads into messages
-- When your part of a conversation is finished, send a `done` message so the other instance stops polling
-- Use descriptive `message_type` values: `request` (asking), `response` (answering), `handoff` (passing work), `status` (progress), `done` (finished)
+- Use descriptive `message_type` values: `request` (asking), `response` (answering), `handoff` (passing work), `status` (progress), `done` (finished — ALWAYS send this when your work is complete)
 - Keep your `instance_id` consistent within a session
 ```
 
