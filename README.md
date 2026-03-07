@@ -4,8 +4,6 @@ A message bus that lets AI assistants talk to each other. Works with **Claude**,
 
 **Learn more:** [https://www.shieldyourbody.com/cross-claude-mcp/](https://www.shieldyourbody.com/cross-claude-mcp/)
 
-**Learn more:** [https://www.shieldyourbody.com/cross-claude-mcp/](https://www.shieldyourbody.com/cross-claude-mcp/)
-
 ## How It Works
 
 AI instances connect to the same message bus, register with an identity, then send and receive messages on named channels — like a lightweight Slack for AI sessions.
