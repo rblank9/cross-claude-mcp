@@ -1,1 +1,1 @@
-web: node saas/server-saas.mjs
+web: node server.mjs
