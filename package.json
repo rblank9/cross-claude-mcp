@@ -9,6 +9,7 @@
   },
   "scripts": {
     "start": "node server.mjs",
+    "start:saas": "node saas/server-saas.mjs",
     "test": "node test.mjs"
   },
   "keywords": [
