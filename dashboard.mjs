@@ -22,8 +22,9 @@ export { PLAN_LIMITS };
 
 // --- HTML layout ---
 
-function layout(title, body, flash = null) {
+function layout(title, body, flash = null, isAdmin = false) {
   const flashHtml = flash ? `<div class="flash ${flash.type}">${escHtml(flash.text)}</div>` : "";
+  const adminLink = isAdmin ? `<a href="/admin">Admin</a>` : "";
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${escHtml(title)} - Cross-Claude MCP</title>
@@ -77,6 +78,7 @@ th{font-weight:600;color:#666;font-size:0.85em;text-transform:uppercase;letter-s
 <nav class="nav">
   <span class="brand">Cross-Claude MCP</span>
   <a href="/dashboard">Dashboard</a>
+  ${adminLink}
   <a href="/logout">Logout</a>
 </nav>
 <div class="container">${flashHtml}${body}</div>
@@ -364,7 +366,7 @@ export function createDashboardRouter(db) {
         </div>
 
         ${upgradeSection}
-      `, flash));
+      `, flash, tenant.is_admin));
     } catch (err) {
       console.error("Dashboard error:", err);
       res.status(500).send("Something went wrong.");
