@@ -29,8 +29,9 @@ import { createDB, isSaasMode, TenantDB } from "./db.mjs";
 const STALE_THRESHOLD_SECONDS = 120;
 
 // --- Tool Registration (shared between all transport modes) ---
+// planChecker is optional — only set in SaaS mode. Called before tool execution.
 
-function registerTools(server, db) {
+function registerTools(server, db, planChecker = null) {
   // Track instance per-connection for shutdown cleanup
   let currentInstanceId = null;
 
@@ -47,6 +48,10 @@ function registerTools(server, db) {
       description: z.string().optional().describe("What this instance is working on"),
     },
     async ({ instance_id, description }) => {
+      if (planChecker) {
+        const check = await planChecker("register");
+        if (!check.allowed) return { content: [{ type: "text", text: check.message }] };
+      }
       if (currentInstanceId && currentInstanceId !== instance_id) {
         await db.markOffline(currentInstanceId);
       }
@@ -70,6 +75,10 @@ function registerTools(server, db) {
       in_reply_to: z.number().optional().describe("Message ID this is replying to"),
     },
     async ({ channel, sender, content, message_type, in_reply_to }) => {
+      if (planChecker) {
+        const check = await planChecker("send_message");
+        if (!check.allowed) return { content: [{ type: "text", text: check.message }] };
+      }
       await db.createChannel(channel, null);
       touchHeartbeat();
       const id = await db.sendMessage(channel, sender, content, message_type, in_reply_to || null);
@@ -178,6 +187,10 @@ function registerTools(server, db) {
       description: z.string().optional().describe("What this channel is for"),
     },
     async ({ name, description }) => {
+      if (planChecker) {
+        const check = await planChecker("create_channel");
+        if (!check.allowed) return { content: [{ type: "text", text: check.message }] };
+      }
       await db.createChannel(name, description || null);
       return { content: [{ type: "text", text: `Channel #${name} created.${description ? ` Purpose: ${description}` : ""}` }] };
     }
@@ -229,6 +242,10 @@ function registerTools(server, db) {
       description: z.string().optional().describe("Brief description of what this data is"),
     },
     async ({ key, content, sender, description }) => {
+      if (planChecker) {
+        const check = await planChecker("share_data");
+        if (!check.allowed) return { content: [{ type: "text", text: check.message }] };
+      }
       touchHeartbeat();
       await db.shareData(key, content, sender, description || null);
       const sizeKb = (Buffer.byteLength(content) / 1024).toFixed(1);
@@ -444,11 +461,17 @@ li{margin:4px 0}</style></head>
 
       // In SaaS mode, use tenant-scoped DB; otherwise use shared DB
       const sessionDb = req.tenantDb || db;
-      const cleanup = registerTools(server, sessionDb);
+      let planCheck = null;
+      if (saas && req.tenant) {
+        const { checkPlanLimits } = await import("./rate-limit.mjs");
+        const tenant = req.tenant;
+        planCheck = (action) => checkPlanLimits(db, tenant, action);
+      }
+      const cleanup = registerTools(server, sessionDb, planCheck);
 
       await server.connect(transport);
 
-      const sessionEntry = { server, transport, cleanup };
+      const sessionEntry = { server, transport, cleanup, tenantId: req.tenant?.id || null };
 
       transport.onclose = () => {
         const sid = transport.sessionId;
@@ -464,6 +487,11 @@ li{margin:4px 0}</style></head>
         sessions.set(transport.sessionId, sessionEntry);
       }
       return;
+    }
+
+    // Verify the resuming client owns this session
+    if (saas && session.tenantId !== req.tenant?.id) {
+      return res.status(403).json({ error: "Session tenant mismatch" });
     }
 
     await session.transport.handleRequest(req, res, req.body);
@@ -502,7 +530,13 @@ li{margin:4px 0}</style></head>
     const server = new McpServer({ name: "cross-claude-mcp", version: "2.0.0" });
 
     const sessionDb = req.tenantDb || db;
-    const cleanup = registerTools(server, sessionDb);
+    let planCheck = null;
+    if (saas && req.tenant) {
+      const { checkPlanLimits } = await import("./rate-limit.mjs");
+      const tenant = req.tenant;
+      planCheck = (action) => checkPlanLimits(db, tenant, action);
+    }
+    const cleanup = registerTools(server, sessionDb, planCheck);
 
     sseTransports.set(transport.sessionId, { server, transport, cleanup });
 

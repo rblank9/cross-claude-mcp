@@ -10,6 +10,14 @@ const tenantWindows = new Map(); // tenantId -> { count, windowStart }
 const WINDOW_MS = 60 * 1000; // 1 minute
 const MAX_CALLS_PER_MINUTE = 60;
 
+// Prune stale entries every 5 minutes to prevent unbounded growth
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, w] of tenantWindows) {
+    if (now - w.windowStart > WINDOW_MS) tenantWindows.delete(id);
+  }
+}, 5 * 60 * 1000).unref();
+
 export function checkRateLimit(tenantId) {
   const now = Date.now();
   let window = tenantWindows.get(tenantId);

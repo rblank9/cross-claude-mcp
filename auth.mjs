@@ -61,10 +61,9 @@ export function generateCsrfToken(session) {
 export function validateCsrf(req, res, next) {
   if (req.method !== "POST") return next();
 
-  // Skip CSRF for API routes (they use Bearer token auth)
-  if (req.path.startsWith("/api/")) return next();
-  // Skip for MCP endpoints
-  if (req.path === "/mcp" || req.path === "/messages") return next();
+  // Skip CSRF for MCP endpoints (Bearer token auth) and Stripe webhook (signature-verified)
+  const CSRF_SKIP = ["/mcp", "/messages", "/api/billing/webhook"];
+  if (CSRF_SKIP.some(p => req.path === p)) return next();
 
   const token = req.body?._csrf;
   if (!token || token !== req.session?.csrfToken) {

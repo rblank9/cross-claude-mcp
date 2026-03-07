@@ -163,7 +163,11 @@ export function createWebhookHandler(db) {
         case "customer.subscription.updated": {
           const subscription = event.data.object;
           const priceId = subscription.items?.data?.[0]?.price?.id;
-          const plan = PRICE_TO_PLAN[priceId] || "free";
+          const plan = PRICE_TO_PLAN[priceId];
+          if (!plan) {
+            console.error(`Webhook: unknown price ID ${priceId} for subscription ${subscription.id} — no plan change made`);
+            break;
+          }
           // Find tenant by stripe_subscription_id
           const result = await db.pool.query(
             `SELECT id FROM tenants WHERE stripe_subscription_id = $1`,

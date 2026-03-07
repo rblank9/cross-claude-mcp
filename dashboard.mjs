@@ -178,11 +178,14 @@ export function createDashboardRouter(db) {
       await db.createTenant(id, email.toLowerCase().trim(), passwordHash, name || null, apiKey, isAdmin);
       await db.seedTenantChannel(id);
 
-      // Auto-login
-      req.session.tenantId = id;
-      req.session.isAdmin = isAdmin;
-      req.session.flashMsg = { type: "success", text: "Account created! Here's your API key." };
-      res.redirect("/dashboard");
+      // Auto-login with session regeneration (prevent session fixation)
+      req.session.regenerate((err) => {
+        if (err) { console.error("Session regenerate error:", err); return res.redirect("/login"); }
+        req.session.tenantId = id;
+        req.session.isAdmin = isAdmin;
+        req.session.flashMsg = { type: "success", text: "Account created! Here's your API key." };
+        res.redirect("/dashboard");
+      });
     } catch (err) {
       console.error("Signup error:", err);
       req.session.flash = "Something went wrong. Please try again.";
@@ -237,9 +240,13 @@ export function createDashboardRouter(db) {
         return res.redirect("/login");
       }
 
-      req.session.tenantId = tenant.id;
-      req.session.isAdmin = tenant.is_admin;
-      res.redirect("/dashboard");
+      // Regenerate session to prevent session fixation
+      req.session.regenerate((err) => {
+        if (err) { console.error("Session regenerate error:", err); return res.redirect("/login"); }
+        req.session.tenantId = tenant.id;
+        req.session.isAdmin = tenant.is_admin;
+        res.redirect("/dashboard");
+      });
     } catch (err) {
       console.error("Login error:", err);
       req.session.flash = "Something went wrong. Please try again.";
@@ -274,7 +281,7 @@ export function createDashboardRouter(db) {
       const csrf = generateCsrfToken(req.session);
       const appUrl = APP_URL();
 
-      const planBadge = `<span class="badge badge-${tenant.plan}">${tenant.plan.toUpperCase()}</span>`;
+      const planBadge = `<span class="badge badge-${escHtml(tenant.plan)}">${escHtml(tenant.plan).toUpperCase()}</span>`;
       const messagesUsed = tenant.messages_this_month || 0;
       const messagesLimit = limits.messages;
       const instancesLimit = limits.instances === -1 ? "Unlimited" : limits.instances;

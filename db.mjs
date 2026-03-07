@@ -60,13 +60,13 @@ const SAAS_SCHEMA_SQL = `
 
   CREATE TABLE IF NOT EXISTS usage_log (
     id SERIAL PRIMARY KEY,
-    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     action TEXT NOT NULL,
     timestamp TIMESTAMP DEFAULT NOW()
   );
 
   CREATE TABLE IF NOT EXISTS channels (
-    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
     description TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -80,13 +80,13 @@ const SAAS_SCHEMA_SQL = `
     sender TEXT NOT NULL,
     content TEXT NOT NULL,
     message_type TEXT DEFAULT 'message',
-    in_reply_to INTEGER REFERENCES messages(id),
+    in_reply_to INTEGER REFERENCES messages(id) ON DELETE SET NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (tenant_id, channel) REFERENCES channels(tenant_id, name)
+    FOREIGN KEY (tenant_id, channel) REFERENCES channels(tenant_id, name) ON DELETE CASCADE
   );
 
   CREATE TABLE IF NOT EXISTS instances (
-    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     instance_id TEXT NOT NULL,
     description TEXT,
     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -95,7 +95,7 @@ const SAAS_SCHEMA_SQL = `
   );
 
   CREATE TABLE IF NOT EXISTS shared_data (
-    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     key TEXT NOT NULL,
     content TEXT NOT NULL,
     created_by TEXT NOT NULL,
@@ -419,6 +419,51 @@ class SaasPostgresDB {
     this.pool = new pg.Pool({ connectionString: this.connectionString });
     await this.pool.query(SAAS_SCHEMA_SQL);
     await this.pool.query(SAAS_INDEX_SQL);
+    // Migrate existing FK constraints to add ON DELETE CASCADE
+    await this.migrateConstraints();
+  }
+
+  async migrateConstraints() {
+    // For each child table, drop the old FK and re-add with CASCADE if needed
+    const migrations = [
+      { table: 'usage_log', constraint: 'usage_log_tenant_id_fkey', col: 'tenant_id', ref: 'tenants(id)', action: 'CASCADE' },
+      { table: 'channels', constraint: 'channels_tenant_id_fkey', col: 'tenant_id', ref: 'tenants(id)', action: 'CASCADE' },
+      { table: 'instances', constraint: 'instances_tenant_id_fkey', col: 'tenant_id', ref: 'tenants(id)', action: 'CASCADE' },
+      { table: 'shared_data', constraint: 'shared_data_tenant_id_fkey', col: 'tenant_id', ref: 'tenants(id)', action: 'CASCADE' },
+    ];
+    for (const m of migrations) {
+      try {
+        // Check if the constraint already has CASCADE
+        const check = await this.pool.query(
+          `SELECT confdeltype FROM pg_constraint WHERE conname = $1`, [m.constraint]
+        );
+        if (check.rows[0] && check.rows[0].confdeltype === 'c') continue; // already CASCADE
+        if (check.rows[0]) {
+          await this.pool.query(`ALTER TABLE ${m.table} DROP CONSTRAINT ${m.constraint}`);
+          await this.pool.query(`ALTER TABLE ${m.table} ADD CONSTRAINT ${m.constraint} FOREIGN KEY (${m.col}) REFERENCES ${m.ref} ON DELETE ${m.action}`);
+        }
+      } catch { /* constraint may not exist on fresh DBs */ }
+    }
+    // Also fix messages.in_reply_to to SET NULL on delete
+    try {
+      const check = await this.pool.query(
+        `SELECT confdeltype FROM pg_constraint WHERE conname = 'messages_in_reply_to_fkey'`
+      );
+      if (check.rows[0] && check.rows[0].confdeltype !== 'n') {
+        await this.pool.query(`ALTER TABLE messages DROP CONSTRAINT messages_in_reply_to_fkey`);
+        await this.pool.query(`ALTER TABLE messages ADD CONSTRAINT messages_in_reply_to_fkey FOREIGN KEY (in_reply_to) REFERENCES messages(id) ON DELETE SET NULL`);
+      }
+    } catch { /* ignore */ }
+    // Fix messages FK to channels
+    try {
+      const check = await this.pool.query(
+        `SELECT confdeltype FROM pg_constraint WHERE conname = 'messages_tenant_id_channel_fkey'`
+      );
+      if (check.rows[0] && check.rows[0].confdeltype !== 'c') {
+        await this.pool.query(`ALTER TABLE messages DROP CONSTRAINT messages_tenant_id_channel_fkey`);
+        await this.pool.query(`ALTER TABLE messages ADD CONSTRAINT messages_tenant_id_channel_fkey FOREIGN KEY (tenant_id, channel) REFERENCES channels(tenant_id, name) ON DELETE CASCADE`);
+      }
+    } catch { /* ignore */ }
   }
 
   // --- Tenant management (used by auth/billing/admin, not by MCP tools) ---
@@ -447,16 +492,28 @@ class SaasPostgresDB {
   }
 
   async updateTenant(id, fields) {
+    const ALLOWED_FIELDS = new Set([
+      'email', 'password_hash', 'name', 'status', 'plan',
+      'api_key', 'stripe_customer_id', 'stripe_subscription_id',
+      'messages_this_month', 'messages_reset_at', 'is_admin',
+    ]);
     const sets = [];
     const values = [];
     let i = 1;
     for (const [key, value] of Object.entries(fields)) {
+      if (!ALLOWED_FIELDS.has(key)) throw new Error(`Disallowed field: ${key}`);
       sets.push(`${key} = $${i}`);
       values.push(value);
       i++;
     }
     values.push(id);
     await this.pool.query(`UPDATE tenants SET ${sets.join(', ')} WHERE id = $${i}`, values);
+  }
+
+  async deleteTenant(id) {
+    // ON DELETE CASCADE handles child rows (usage_log, channels, messages, instances, shared_data)
+    const result = await this.pool.query(`DELETE FROM tenants WHERE id = $1 RETURNING id`, [id]);
+    return result.rowCount > 0;
   }
 
   async listTenants() {

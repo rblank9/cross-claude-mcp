@@ -137,8 +137,8 @@ export function createAdminRouter(db) {
         <tr>
           <td><a href="/admin/tenants/${escHtml(t.id)}">${escHtml(t.email)}</a></td>
           <td>${escHtml(t.name || "-")}</td>
-          <td><span class="badge badge-${t.plan}">${t.plan}</span></td>
-          <td><span class="badge badge-${t.status}">${t.status}</span></td>
+          <td><span class="badge badge-${escHtml(t.plan)}">${escHtml(t.plan)}</span></td>
+          <td><span class="badge badge-${escHtml(t.status)}">${escHtml(t.status)}</span></td>
           <td>${t.messages_this_month || 0}</td>
           <td class="text-muted">${new Date(t.created_at).toLocaleDateString()}</td>
         </tr>
@@ -257,8 +257,8 @@ export function createAdminRouter(db) {
           <table>
             <tr><td><strong>ID</strong></td><td class="text-muted">${escHtml(tenant.id)}</td></tr>
             <tr><td><strong>Name</strong></td><td>${escHtml(tenant.name || "-")}</td></tr>
-            <tr><td><strong>Plan</strong></td><td><span class="badge badge-${tenant.plan}">${tenant.plan}</span></td></tr>
-            <tr><td><strong>Status</strong></td><td><span class="badge badge-${tenant.status}">${tenant.status}</span></td></tr>
+            <tr><td><strong>Plan</strong></td><td><span class="badge badge-${escHtml(tenant.plan)}">${escHtml(tenant.plan)}</span></td></tr>
+            <tr><td><strong>Status</strong></td><td><span class="badge badge-${escHtml(tenant.status)}">${escHtml(tenant.status)}</span></td></tr>
             <tr><td><strong>Messages This Month</strong></td><td>${tenant.messages_this_month || 0}</td></tr>
             <tr><td><strong>API Key</strong></td><td class="text-muted" style="font-family:monospace;font-size:0.85em">${escHtml(tenant.api_key)}</td></tr>
             <tr><td><strong>Stripe Customer</strong></td><td class="text-muted">${escHtml(tenant.stripe_customer_id || "-")}</td></tr>
@@ -276,6 +276,10 @@ export function createAdminRouter(db) {
             <form method="POST" action="/admin/tenants/${escHtml(tenant.id)}/reset-key">
               <input type="hidden" name="_csrf" value="${csrf}">
               <button class="btn-danger btn-small" onclick="return confirm('Reset API key for this tenant?')">Reset API Key</button>
+            </form>
+            <form method="POST" action="/admin/tenants/${escHtml(tenant.id)}/delete">
+              <input type="hidden" name="_csrf" value="${csrf}">
+              <button class="btn-danger btn-small" onclick="return confirm('PERMANENTLY delete this tenant and ALL their data? This cannot be undone.')">Delete Tenant</button>
             </form>
           </div>
 
@@ -344,12 +348,37 @@ export function createAdminRouter(db) {
 
   router.post("/tenants/:id/reset-key", async (req, res) => {
     try {
+      const tenant = await db.getTenantById(req.params.id);
+      if (!tenant) return res.status(404).send("Tenant not found.");
       const newKey = `cc_${randomUUID().replace(/-/g, "")}`;
-      await db.updateTenant(req.params.id, { api_key: newKey });
-      res.redirect(`/admin/tenants/${req.params.id}`);
+      await db.updateTenant(tenant.id, { api_key: newKey });
+      req.session.adminFlash = { type: "success", text: "API key reset." };
+      res.redirect(`/admin/tenants/${tenant.id}`);
     } catch (err) {
       console.error("Reset key error:", err);
       res.status(500).send("Error resetting key.");
+    }
+  });
+
+  // --- Delete Tenant ---
+
+  router.post("/tenants/:id/delete", async (req, res) => {
+    try {
+      const tenant = await db.getTenantById(req.params.id);
+      if (!tenant) return res.status(404).send("Tenant not found.");
+
+      if (tenant.is_admin) {
+        req.session.adminFlash = { type: "error", text: "Cannot delete an admin account." };
+        return res.redirect(`/admin/tenants/${tenant.id}`);
+      }
+
+      await db.deleteTenant(tenant.id);
+      req.session.adminFlash = { type: "success", text: `Tenant ${tenant.email} deleted.` };
+      res.redirect("/admin/tenants");
+    } catch (err) {
+      console.error("Delete tenant error:", err);
+      req.session.adminFlash = { type: "error", text: "Failed to delete tenant." };
+      res.redirect(`/admin/tenants/${req.params.id}`);
     }
   });
 
