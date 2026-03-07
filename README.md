@@ -55,7 +55,7 @@ cd cross-claude-mcp
 npm install
 ```
 
-Add to Claude Code MCP config (`~/.claude.json` or project `.claude/settings.json`):
+Add to Claude Code MCP config (`~/.claude/settings.json` or project `.claude/settings.json`):
 
 ```json
 {
@@ -100,20 +100,20 @@ Add as a custom connector in Settings → Connectors. Use URL `https://your-serv
 **Claude Desktop**:
 Same as Claude Code — add the mcp-remote config to `~/Library/Application Support/Claude/claude_desktop_config.json`.
 
-**Gemini** (Google AI Studio / Gemini API):
-Gemini supports MCP natively. Add the server URL in your MCP configuration:
+**Gemini** (Google AI Studio):
+Gemini supports MCP via Google AI Studio. Add as a remote MCP server using the Streamable HTTP URL and bearer token. Exact UI steps may vary as Google iterates on their MCP integration.
 ```
 Server URL: https://your-service.up.railway.app/mcp
 Authentication: Bearer YOUR_TOKEN
 ```
 
 **Perplexity**:
-Perplexity supports MCP connections. Configure with the same server URL and bearer token as above.
+Perplexity has announced MCP support. Configure with the same Streamable HTTP URL and bearer token. Check Perplexity's docs for current setup steps.
 
 **ChatGPT** (Custom GPTs via Actions):
 ChatGPT doesn't support MCP, but can use the REST API via Custom GPT Actions:
 
-1. Create a new Custom GPT at [chat.openai.com/gpts/editor](https://chat.openai.com/gpts/editor)
+1. Create a new Custom GPT at [chatgpt.com/gpts/editor](https://chatgpt.com/gpts/editor)
 2. Go to **Configure** → **Actions** → **Create new action**
 3. Set authentication: **API Key**, Auth Type: **Bearer**, paste your `MCP_API_KEY`
 4. Import the OpenAPI schema from: `https://your-service.up.railway.app/openapi.json`
@@ -290,7 +290,7 @@ The **cross-claude** MCP server lets multiple Claude instances communicate via a
 ```
 server.mjs     — Main entry point, MCP + REST transport setup
 tools.mjs      — MCP tool definitions (shared between open-source and SaaS)
-rest-api.mjs   — REST API layer (for ChatGPT, Gemini via HTTP, curl, scripts)
+rest-api.mjs   — REST API layer (for ChatGPT, curl, scripts, non-MCP clients)
 db.mjs         — Database abstraction (SQLite for local, PostgreSQL for remote)
 openapi.json   — OpenAPI 3.1 spec (import into ChatGPT Custom GPT Actions)
 test.mjs       — MCP integration tests (stdio mode)

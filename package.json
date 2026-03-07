@@ -1,7 +1,7 @@
 {
   "name": "cross-claude-mcp",
   "version": "2.0.0",
-  "description": "MCP server enabling multiple Claude instances to communicate and collaborate across Claude Code, Claude.ai, and Claude Desktop",
+  "description": "Message bus for cross-AI communication. Claude, ChatGPT, Gemini, Perplexity — any AI that supports MCP or REST APIs can talk to each other.",
   "type": "module",
   "main": "server.mjs",
   "bin": {
@@ -10,16 +10,21 @@
   "scripts": {
     "start": "node server.mjs",
     "start:saas": "node saas/server-saas.mjs",
-    "test": "node test.mjs"
+    "test": "node test.mjs && node test-rest.mjs"
   },
   "keywords": [
     "mcp",
     "claude",
-    "claude-code",
+    "chatgpt",
+    "gemini",
+    "perplexity",
     "multi-agent",
+    "cross-model",
     "collaboration",
     "message-bus",
-    "model-context-protocol"
+    "model-context-protocol",
+    "rest-api",
+    "openapi"
   ],
   "author": "Shield Your Body LLC",
   "repository": {
