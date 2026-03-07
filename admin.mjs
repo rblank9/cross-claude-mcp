@@ -68,7 +68,7 @@ export function createAdminRouter(db) {
 
   // --- Overview ---
 
-  router.get("/admin", async (req, res) => {
+  router.get("/", async (req, res) => {
     try {
       const stats = await db.getTenantStats();
       const usageToday = await db.getUsageToday();
@@ -125,7 +125,7 @@ export function createAdminRouter(db) {
 
   // --- Tenant list ---
 
-  router.get("/admin/tenants", async (req, res) => {
+  router.get("/tenants", async (req, res) => {
     try {
       const tenants = await db.listTenants();
       const rows = tenants.map(t => `
@@ -156,7 +156,7 @@ export function createAdminRouter(db) {
 
   // --- Tenant detail ---
 
-  router.get("/admin/tenants/:id", async (req, res) => {
+  router.get("/tenants/:id", async (req, res) => {
     try {
       const tenant = await db.getTenantById(req.params.id);
       if (!tenant) return res.status(404).send("Tenant not found.");
@@ -218,7 +218,7 @@ export function createAdminRouter(db) {
 
   // --- Suspend / Reactivate ---
 
-  router.post("/admin/tenants/:id/suspend", async (req, res) => {
+  router.post("/tenants/:id/suspend", async (req, res) => {
     try {
       const tenant = await db.getTenantById(req.params.id);
       if (!tenant) return res.status(404).send("Tenant not found.");
@@ -234,7 +234,7 @@ export function createAdminRouter(db) {
 
   // --- Reset API Key ---
 
-  router.post("/admin/tenants/:id/reset-key", async (req, res) => {
+  router.post("/tenants/:id/reset-key", async (req, res) => {
     try {
       const newKey = `cc_${randomUUID().replace(/-/g, "")}`;
       await db.updateTenant(req.params.id, { api_key: newKey });

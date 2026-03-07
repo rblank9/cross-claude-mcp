@@ -379,7 +379,7 @@ li{margin:4px 0}</style></head>
     // Mount web UI routes
     app.use(createDashboardRouter(db));
     app.use(createBillingRouter(db));
-    app.use(createAdminRouter(db));
+    app.use("/admin", createAdminRouter(db));
 
     // --- MCP auth middleware: resolve API key -> tenant ---
     const MCP_PATHS = ["/mcp", "/sse", "/messages"];
