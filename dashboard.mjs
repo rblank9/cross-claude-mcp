@@ -365,11 +365,74 @@ export function createDashboardRouter(db) {
           <div class="config-block">${appUrl}/mcp?api_key=${escHtml(tenant.api_key)}</div>
         </div>
 
+        <h2>Change Password</h2>
+        <div class="card">
+          <form method="POST" action="/dashboard/change-password">
+            <input type="hidden" name="_csrf" value="${csrf}">
+            <div class="form-group">
+              <label for="current_password">Current Password</label>
+              <input type="password" id="current_password" name="current_password" required autocomplete="current-password">
+            </div>
+            <div class="form-group">
+              <label for="new_password">New Password</label>
+              <input type="password" id="new_password" name="new_password" required minlength="8" autocomplete="new-password">
+            </div>
+            <div class="form-group">
+              <label for="confirm_password">Confirm New Password</label>
+              <input type="password" id="confirm_password" name="confirm_password" required minlength="8" autocomplete="new-password">
+            </div>
+            <button class="btn-primary btn-small">Update Password</button>
+          </form>
+        </div>
+
         ${upgradeSection}
       `, flash, tenant.is_admin));
     } catch (err) {
       console.error("Dashboard error:", err);
       res.status(500).send("Something went wrong.");
+    }
+  });
+
+  // --- Change password ---
+
+  router.post("/dashboard/change-password", requireLogin, async (req, res) => {
+    try {
+      const { current_password, new_password, confirm_password } = req.body;
+
+      if (!current_password || !new_password || !confirm_password) {
+        req.session.flashMsg = { type: "error", text: "All password fields are required." };
+        return res.redirect("/dashboard");
+      }
+      if (new_password.length < 8) {
+        req.session.flashMsg = { type: "error", text: "New password must be at least 8 characters." };
+        return res.redirect("/dashboard");
+      }
+      if (new_password !== confirm_password) {
+        req.session.flashMsg = { type: "error", text: "New passwords do not match." };
+        return res.redirect("/dashboard");
+      }
+
+      const tenant = await db.getTenantById(req.session.tenantId);
+      if (!tenant) {
+        req.session.destroy(() => res.redirect("/login"));
+        return;
+      }
+
+      const valid = await verifyPassword(current_password, tenant.password_hash);
+      if (!valid) {
+        req.session.flashMsg = { type: "error", text: "Current password is incorrect." };
+        return res.redirect("/dashboard");
+      }
+
+      const newHash = await hashPassword(new_password);
+      await db.updateTenant(tenant.id, { password_hash: newHash });
+
+      req.session.flashMsg = { type: "success", text: "Password updated successfully." };
+      res.redirect("/dashboard");
+    } catch (err) {
+      console.error("Change password error:", err);
+      req.session.flashMsg = { type: "error", text: "Failed to change password." };
+      res.redirect("/dashboard");
     }
   });
 

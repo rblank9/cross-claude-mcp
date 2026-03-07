@@ -237,6 +237,9 @@ export function createAdminRouter(db) {
 
       const usage = await db.getRecentUsage(tenant.id, 20);
       const csrf = generateCsrfToken(req.session);
+      const flash = req.session.adminFlash || null;
+      req.session.adminFlash = null;
+      const flashHtml = flash ? `<div style="padding:12px 16px;border-radius:6px;margin-bottom:16px;font-size:0.9em;background:${flash.type === 'success' ? '#d4edda;color:#155724;border:1px solid #c3e6cb' : '#f8d7da;color:#721c24;border:1px solid #f5c6cb'}">${escHtml(flash.text)}</div>` : "";
 
       const usageRows = usage.map(u => `
         <tr>
@@ -248,6 +251,7 @@ export function createAdminRouter(db) {
       res.type("html").send(adminLayout(`Tenant: ${tenant.email}`, `
         <a href="/admin/tenants" class="back">&larr; Back to tenants</a>
         <h1>${escHtml(tenant.email)}</h1>
+        ${flashHtml}
 
         <div class="card">
           <table>
@@ -274,6 +278,16 @@ export function createAdminRouter(db) {
               <button class="btn-danger btn-small" onclick="return confirm('Reset API key for this tenant?')">Reset API Key</button>
             </form>
           </div>
+
+          <h2 style="margin-top:24px;margin-bottom:12px">Set Password</h2>
+          <form method="POST" action="/admin/tenants/${escHtml(tenant.id)}/set-password" style="display:flex;gap:8px;align-items:flex-end">
+            <input type="hidden" name="_csrf" value="${csrf}">
+            <div style="flex:1">
+              <label style="display:block;font-weight:600;font-size:0.9em;margin-bottom:4px">New Password</label>
+              <input type="password" name="new_password" required minlength="8" style="width:100%;padding:8px 10px;border:1px solid #ddd;border-radius:6px" autocomplete="new-password">
+            </div>
+            <button class="btn-warning btn-small" onclick="return confirm('Set new password for this tenant?')">Set Password</button>
+          </form>
         </div>
 
         <h2>Recent Activity</h2>
@@ -303,6 +317,26 @@ export function createAdminRouter(db) {
     } catch (err) {
       console.error("Suspend error:", err);
       res.status(500).send("Error toggling status.");
+    }
+  });
+
+  // --- Set Password (admin) ---
+
+  router.post("/tenants/:id/set-password", async (req, res) => {
+    try {
+      const { new_password } = req.body;
+      if (!new_password || new_password.length < 8) {
+        req.session.adminFlash = { type: "error", text: "Password must be at least 8 characters." };
+        return res.redirect(`/admin/tenants/${req.params.id}`);
+      }
+      const passwordHash = await hashPassword(new_password);
+      await db.updateTenant(req.params.id, { password_hash: passwordHash });
+      req.session.adminFlash = { type: "success", text: "Password updated." };
+      res.redirect(`/admin/tenants/${req.params.id}`);
+    } catch (err) {
+      console.error("Set password error:", err);
+      req.session.adminFlash = { type: "error", text: "Failed to set password." };
+      res.redirect(`/admin/tenants/${req.params.id}`);
     }
   });
 
