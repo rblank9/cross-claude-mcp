@@ -18,6 +18,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createDB } from "./db.mjs";
 import { registerTools } from "./tools.mjs";
+import { createRestRouter } from "./rest-api.mjs";
 
 // --- Transport: Stdio (local) ---
 
@@ -88,11 +89,21 @@ li{margin:4px 0}</style></head>
 <body><p>${escaped}</p></body></html>`);
   });
 
+  // --- OpenAPI spec (no auth, needed for ChatGPT Custom GPT Actions) ---
+
+  app.get("/openapi.json", async (req, res) => {
+    const { readFileSync } = await import("fs");
+    const { join, dirname } = await import("path");
+    const { fileURLToPath } = await import("url");
+    const __dirname = dirname(fileURLToPath(import.meta.url));
+    res.type("json").send(readFileSync(join(__dirname, "openapi.json"), "utf-8"));
+  });
+
   // --- Bearer token auth ---
 
   const API_TOKEN = process.env.MCP_API_KEY;
   app.use((req, res, next) => {
-    if (req.path === "/health" || req.path === "/readme") return next();
+    if (req.path === "/health" || req.path === "/readme" || req.path === "/openapi.json") return next();
 
     if (API_TOKEN) {
       const authHeader = req.headers.authorization || "";
@@ -104,6 +115,10 @@ li{margin:4px 0}</style></head>
     }
     next();
   });
+
+  // --- REST API (for ChatGPT, Gemini, curl, etc.) ---
+
+  app.use("/api", express.json(), createRestRouter(db));
 
   // --- Streamable HTTP transport ---
 
@@ -205,6 +220,7 @@ li{margin:4px 0}</style></head>
     console.log(`cross-claude-mcp v2.0.0 listening on port ${PORT}`);
     console.log(`  Mode:            Standard`);
     console.log(`  Streamable HTTP: POST/GET /mcp`);
+    console.log(`  REST API:        /api/* (ChatGPT, Gemini, curl)`);
     console.log(`  Legacy SSE:      GET /sse, POST /messages`);
     console.log(`  Health:          GET /health`);
     console.log(`  Auth:            ${process.env.MCP_API_KEY ? "Bearer token required" : "NONE (set MCP_API_KEY)"}`);
