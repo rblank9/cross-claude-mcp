@@ -42,6 +42,19 @@ const INDEX_SQL = `
   CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
 `;
 
+/**
+ * Normalize channel names: lowercase, replace spaces/underscores with hyphens,
+ * strip non-alphanumeric (except hyphens), collapse multiple hyphens.
+ */
+export function normalizeChannelName(name) {
+  return name
+    .toLowerCase()
+    .replace(/[\s_]+/g, "-")
+    .replace(/[^a-z0-9-]/g, "")
+    .replace(/-{2,}/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
 const SEED_SQL = `INSERT INTO channels (name, description) VALUES ('general', 'Default channel for cross-instance communication') ON CONFLICT (name) DO NOTHING`;
 
 // --- SQLite Implementation ---
@@ -100,6 +113,41 @@ class SqliteDB {
 
   listChannels() {
     return this.db.prepare(`SELECT * FROM channels ORDER BY name`).all();
+  }
+
+  listChannelsWithActivity() {
+    return this.db.prepare(`
+      SELECT c.*,
+        COALESCE(s.message_count, 0) as message_count,
+        s.last_message_at,
+        s.active_senders
+      FROM channels c
+      LEFT JOIN (
+        SELECT channel,
+          COUNT(*) as message_count,
+          MAX(created_at) as last_message_at,
+          GROUP_CONCAT(DISTINCT sender) as active_senders
+        FROM messages
+        GROUP BY channel
+      ) s ON c.name = s.channel
+      ORDER BY s.last_message_at DESC NULLS LAST, c.name
+    `).all();
+  }
+
+  findChannels(query) {
+    const pattern = `%${query}%`;
+    return this.db.prepare(`
+      SELECT c.*,
+        COALESCE(s.message_count, 0) as message_count,
+        s.last_message_at
+      FROM channels c
+      LEFT JOIN (
+        SELECT channel, COUNT(*) as message_count, MAX(created_at) as last_message_at
+        FROM messages GROUP BY channel
+      ) s ON c.name = s.channel
+      WHERE c.name LIKE ? OR c.description LIKE ?
+      ORDER BY s.last_message_at DESC NULLS LAST
+    `).all(pattern, pattern);
   }
 
   sendMessage(channel, sender, content, messageType, inReplyTo) {
@@ -174,6 +222,20 @@ class SqliteDB {
   deleteSharedData(key) {
     this.db.prepare(`DELETE FROM shared_data WHERE key = ?`).run(key);
   }
+
+  cleanup(maxAgeDays = 7) {
+    const interval = `-${maxAgeDays} days`;
+    const msgs = this.db.prepare(`DELETE FROM messages WHERE created_at < datetime('now', ?)`).run(interval);
+    const inst = this.db.prepare(`DELETE FROM instances WHERE last_seen < datetime('now', ?)`).run(interval);
+    const data = this.db.prepare(`DELETE FROM shared_data WHERE created_at < datetime('now', ?)`).run(interval);
+    return { messages: msgs.changes, instances: inst.changes, shared_data: data.changes };
+  }
+
+  purgeAll() {
+    this.db.prepare(`DELETE FROM messages`).run();
+    this.db.prepare(`DELETE FROM instances`).run();
+    this.db.prepare(`DELETE FROM shared_data`).run();
+  }
 }
 
 // --- PostgreSQL Implementation ---
@@ -234,6 +296,43 @@ class PostgresDB {
 
   async listChannels() {
     const result = await this.pool.query(`SELECT * FROM channels ORDER BY name`);
+    return result.rows;
+  }
+
+  async listChannelsWithActivity() {
+    const result = await this.pool.query(`
+      SELECT c.*,
+        COALESCE(s.message_count, 0)::int as message_count,
+        s.last_message_at,
+        s.active_senders
+      FROM channels c
+      LEFT JOIN (
+        SELECT channel,
+          COUNT(*)::int as message_count,
+          MAX(created_at) as last_message_at,
+          STRING_AGG(DISTINCT sender, ', ') as active_senders
+        FROM messages
+        GROUP BY channel
+      ) s ON c.name = s.channel
+      ORDER BY s.last_message_at DESC NULLS LAST, c.name
+    `);
+    return result.rows;
+  }
+
+  async findChannels(query) {
+    const pattern = `%${query}%`;
+    const result = await this.pool.query(`
+      SELECT c.*,
+        COALESCE(s.message_count, 0)::int as message_count,
+        s.last_message_at
+      FROM channels c
+      LEFT JOIN (
+        SELECT channel, COUNT(*)::int as message_count, MAX(created_at) as last_message_at
+        FROM messages GROUP BY channel
+      ) s ON c.name = s.channel
+      WHERE c.name ILIKE $1 OR c.description ILIKE $1
+      ORDER BY s.last_message_at DESC NULLS LAST
+    `, [pattern]);
     return result.rows;
   }
 
@@ -326,6 +425,20 @@ class PostgresDB {
 
   async deleteSharedData(key) {
     await this.pool.query(`DELETE FROM shared_data WHERE key = $1`, [key]);
+  }
+
+  async cleanup(maxAgeDays = 7) {
+    const interval = `${maxAgeDays} days`;
+    const msgs = await this.pool.query(`DELETE FROM messages WHERE created_at < NOW() - INTERVAL '1 day' * $1`, [maxAgeDays]);
+    const inst = await this.pool.query(`DELETE FROM instances WHERE last_seen < NOW() - INTERVAL '1 day' * $1`, [maxAgeDays]);
+    const data = await this.pool.query(`DELETE FROM shared_data WHERE created_at < NOW() - INTERVAL '1 day' * $1`, [maxAgeDays]);
+    return { messages: msgs.rowCount, instances: inst.rowCount, shared_data: data.rowCount };
+  }
+
+  async purgeAll() {
+    await this.pool.query(`DELETE FROM messages`);
+    await this.pool.query(`DELETE FROM instances`);
+    await this.pool.query(`DELETE FROM shared_data`);
   }
 }
 

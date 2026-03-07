@@ -125,10 +125,10 @@
       },
       "get": {
         "operationId": "listChannels",
-        "summary": "List all channels",
+        "summary": "List all channels with activity stats (message count, last activity, participants)",
         "responses": {
           "200": {
-            "description": "List of channels",
+            "description": "List of channels with activity",
             "content": {
               "application/json": {
                 "schema": {
@@ -140,7 +140,45 @@
                         "type": "object",
                         "properties": {
                           "name": { "type": "string" },
-                          "description": { "type": "string" }
+                          "description": { "type": "string" },
+                          "message_count": { "type": "integer", "description": "Total messages in channel" },
+                          "last_message_at": { "type": "string", "description": "Timestamp of most recent message" },
+                          "active_senders": { "type": "string", "description": "Comma-separated list of participants" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/channels/search": {
+      "get": {
+        "operationId": "findChannel",
+        "summary": "Search for channels by keyword (matches name and description)",
+        "parameters": [
+          { "name": "q", "in": "query", "required": true, "schema": { "type": "string" }, "description": "Keyword to search for" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Matching channels",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "channels": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": { "type": "string" },
+                          "description": { "type": "string" },
+                          "message_count": { "type": "integer" },
+                          "last_message_at": { "type": "string" }
                         }
                       }
                     }

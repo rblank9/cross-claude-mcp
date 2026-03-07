@@ -10,6 +10,7 @@
 
 import { Router } from "express";
 import { STALE_THRESHOLD_SECONDS } from "./tools.mjs";
+import { normalizeChannelName } from "./db.mjs";
 
 /**
  * @param {object} db - Database instance (SqliteDB or PostgresDB)
@@ -50,14 +51,25 @@ export function createRestRouter(db) {
     try {
       const { name, description } = req.body;
       if (!name) return res.status(400).json({ error: "name is required" });
-      await db.createChannel(name, description || null);
-      res.json({ ok: true, channel: name });
+      const normalized = normalizeChannelName(name);
+      if (!normalized) return res.status(400).json({ error: `Invalid channel name "${name}"` });
+      await db.createChannel(normalized, description || null);
+      res.json({ ok: true, channel: normalized });
     } catch (e) { next(e); }
   });
 
   router.get("/channels", async (req, res, next) => {
     try {
-      const channels = await db.listChannels();
+      const channels = await db.listChannelsWithActivity();
+      res.json({ channels });
+    } catch (e) { next(e); }
+  });
+
+  router.get("/channels/search", async (req, res, next) => {
+    try {
+      const { q } = req.query;
+      if (!q) return res.status(400).json({ error: "q (query) parameter is required" });
+      const channels = await db.findChannels(q);
       res.json({ channels });
     } catch (e) { next(e); }
   });
@@ -73,10 +85,12 @@ export function createRestRouter(db) {
       if (!validTypes.includes(message_type)) {
         return res.status(400).json({ error: `message_type must be one of: ${validTypes.join(", ")}` });
       }
+      const normalized = normalizeChannelName(channel);
+      if (!normalized) return res.status(400).json({ error: `Invalid channel name "${channel}"` });
       // Auto-create channel if it doesn't exist
-      await db.createChannel(channel, null);
-      const id = await db.sendMessage(channel, sender, content, message_type, in_reply_to || null);
-      res.json({ ok: true, id: Number(id), channel, message_type });
+      await db.createChannel(normalized, null);
+      const id = await db.sendMessage(normalized, sender, content, message_type, in_reply_to || null);
+      res.json({ ok: true, id: Number(id), channel: normalized, message_type });
     } catch (e) { next(e); }
   });
 

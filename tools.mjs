@@ -4,8 +4,25 @@
  */
 
 import { z } from "zod";
+import { normalizeChannelName } from "./db.mjs";
 
 export const STALE_THRESHOLD_SECONDS = 120;
+
+/** Simple check: are two strings within edit distance 2? Good enough for channel name typos. */
+function levenshteinClose(a, b) {
+  if (Math.abs(a.length - b.length) > 2) return false;
+  const matrix = Array.from({ length: a.length + 1 }, (_, i) =>
+    Array.from({ length: b.length + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0))
+  );
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      matrix[i][j] = a[i - 1] === b[j - 1]
+        ? matrix[i - 1][j - 1]
+        : 1 + Math.min(matrix[i - 1][j], matrix[i][j - 1], matrix[i - 1][j - 1]);
+    }
+  }
+  return matrix[a.length][b.length] <= 2;
+}
 
 /**
  * Register all Cross-Claude MCP tools on a server instance.
@@ -39,8 +56,27 @@ export function registerTools(server, db, planChecker = null) {
       }
       currentInstanceId = instance_id;
       await db.registerInstance(instance_id, description || null);
+
+      // Provide context: active channels and online instances
+      const channels = await db.listChannelsWithActivity();
+      const activeChannels = channels.filter(c => c.message_count > 0);
+      const channelSummary = activeChannels.length > 0
+        ? "\n\nActive channels:\n" + activeChannels.map(c =>
+            `  #${c.name} (${c.message_count} msgs, last: ${c.last_message_at})${c.description ? ` - ${c.description}` : ""}`
+          ).join("\n")
+        : "\n\nNo active channels yet. Use 'general' or create a new one.";
+
+      await db.markStaleOffline(STALE_THRESHOLD_SECONDS);
+      const instances = await db.listInstances();
+      const others = instances.filter(i => i.instance_id !== instance_id && i.status === "online");
+      const instanceSummary = others.length > 0
+        ? "\n\nOnline instances:\n" + others.map(i =>
+            `  ${i.instance_id}${i.description ? ` - ${i.description}` : ""}`
+          ).join("\n")
+        : "\n\nNo other instances online.";
+
       return {
-        content: [{ type: "text", text: `Registered as "${instance_id}". You can now send and receive messages. Use 'check_messages' to see if anyone has sent you anything.` }],
+        content: [{ type: "text", text: `Registered as "${instance_id}".${channelSummary}${instanceSummary}\n\nUse 'check_messages' to see if anyone has sent you anything.` }],
       };
     }
   );
@@ -61,11 +97,34 @@ export function registerTools(server, db, planChecker = null) {
         const check = await planChecker("send_message");
         if (!check.allowed) return { content: [{ type: "text", text: check.message }] };
       }
-      await db.createChannel(channel, null);
+      const normalized = normalizeChannelName(channel);
+      if (!normalized) {
+        return { content: [{ type: "text", text: `Invalid channel name "${channel}". Use lowercase letters, numbers, and hyphens.` }] };
+      }
+
+      // Check if this channel already exists
+      const existingChannels = await db.listChannels();
+      const exists = existingChannels.some(c => c.name === normalized);
+      let warning = "";
+
+      if (!exists) {
+        // Find similar existing channels to warn about
+        const similar = existingChannels.filter(c => {
+          const n = c.name;
+          return n.includes(normalized) || normalized.includes(n)
+            || levenshteinClose(n, normalized);
+        });
+        if (similar.length > 0) {
+          warning = `\n\n⚠️ New channel #${normalized} created. Did you mean one of these? ${similar.map(c => `#${c.name}`).join(", ")}`;
+        }
+      }
+
+      await db.createChannel(normalized, null);
       touchHeartbeat();
-      const id = await db.sendMessage(channel, sender, content, message_type, in_reply_to || null);
+      const id = await db.sendMessage(normalized, sender, content, message_type, in_reply_to || null);
+      const nameNote = normalized !== channel ? ` (normalized from "${channel}")` : "";
       return {
-        content: [{ type: "text", text: `Message #${id} sent to #${channel} as "${sender}" [${message_type}]` }],
+        content: [{ type: "text", text: `Message #${id} sent to #${normalized}${nameNote} as "${sender}" [${message_type}]${warning}` }],
       };
     }
   );
@@ -80,19 +139,20 @@ export function registerTools(server, db, planChecker = null) {
       instance_id: z.string().optional().describe("Your instance_id - filters out your own messages"),
     },
     async ({ channel, after_id, limit, instance_id }) => {
+      const normalized = normalizeChannelName(channel);
       touchHeartbeat();
       let messages;
       if (instance_id && after_id !== undefined) {
-        messages = await db.getUnread(channel, after_id, instance_id);
+        messages = await db.getUnread(normalized, after_id, instance_id);
       } else if (after_id !== undefined) {
-        messages = await db.getMessagesSince(channel, after_id);
+        messages = await db.getMessagesSince(normalized, after_id);
       } else {
-        messages = await db.getMessages(channel, limit);
+        messages = await db.getMessages(normalized, limit);
         messages.reverse();
       }
 
       if (messages.length === 0) {
-        return { content: [{ type: "text", text: `No ${after_id !== undefined ? "new " : ""}messages in #${channel}.` }] };
+        return { content: [{ type: "text", text: `No ${after_id !== undefined ? "new " : ""}messages in #${normalized}.` }] };
       }
 
       const formatted = messages.map((m) =>
@@ -101,7 +161,7 @@ export function registerTools(server, db, planChecker = null) {
 
       const lastId = messages[messages.length - 1].id;
       return {
-        content: [{ type: "text", text: `${messages.length} message(s) in #${channel}:\n\n${formatted}\n\n---\nLast message ID: ${lastId} (use as after_id to poll for new messages)` }],
+        content: [{ type: "text", text: `${messages.length} message(s) in #${normalized}:\n\n${formatted}\n\n---\nLast message ID: ${lastId} (use as after_id to poll for new messages)` }],
       };
     }
   );
@@ -117,11 +177,12 @@ export function registerTools(server, db, planChecker = null) {
       poll_interval_seconds: z.number().default(5).describe("Seconds between polls (default: 5)"),
     },
     async ({ channel, after_id, instance_id, timeout_seconds, poll_interval_seconds }) => {
+      const normalized = normalizeChannelName(channel);
       const deadline = Date.now() + timeout_seconds * 1000;
 
       while (Date.now() < deadline) {
         touchHeartbeat();
-        const messages = await db.getUnread(channel, after_id, instance_id);
+        const messages = await db.getUnread(normalized, after_id, instance_id);
 
         if (messages.length > 0) {
           const hasDone = messages.some((m) => m.message_type === "done");
@@ -130,7 +191,7 @@ export function registerTools(server, db, planChecker = null) {
           ).join("\n\n---\n\n");
           const lastId = messages[messages.length - 1].id;
           return {
-            content: [{ type: "text", text: `${messages.length} new message(s) in #${channel}:\n\n${formatted}\n\n---\nLast message ID: ${lastId}${hasDone ? "\n\nThe other instance signaled DONE -- no further replies expected." : ""}` }],
+            content: [{ type: "text", text: `${messages.length} new message(s) in #${normalized}:\n\n${formatted}\n\n---\nLast message ID: ${lastId}${hasDone ? "\n\nThe other instance signaled DONE -- no further replies expected." : ""}` }],
           };
         }
 
@@ -138,7 +199,7 @@ export function registerTools(server, db, planChecker = null) {
       }
 
       return {
-        content: [{ type: "text", text: `No new messages in #${channel} after waiting ${timeout_seconds}s. The other instance may be busy or offline. You can try again or check list_instances.` }],
+        content: [{ type: "text", text: `No new messages in #${normalized} after waiting ${timeout_seconds}s. The other instance may be busy or offline. You can try again or check list_instances.` }],
       };
     }
   );
@@ -173,16 +234,74 @@ export function registerTools(server, db, planChecker = null) {
         const check = await planChecker("create_channel");
         if (!check.allowed) return { content: [{ type: "text", text: check.message }] };
       }
-      await db.createChannel(name, description || null);
-      return { content: [{ type: "text", text: `Channel #${name} created.${description ? ` Purpose: ${description}` : ""}` }] };
+      const normalized = normalizeChannelName(name);
+      if (!normalized) {
+        return { content: [{ type: "text", text: `Invalid channel name "${name}". Use lowercase letters, numbers, and hyphens.` }] };
+      }
+
+      // Check for similar existing channels
+      const existing = await db.listChannels();
+      const similar = existing.filter(c => c.name !== normalized && (
+        c.name.includes(normalized) || normalized.includes(c.name) || levenshteinClose(c.name, normalized)
+      ));
+
+      await db.createChannel(normalized, description || null);
+      const nameNote = normalized !== name ? ` (normalized from "${name}")` : "";
+      const similarNote = similar.length > 0
+        ? `\nNote: similar channels exist: ${similar.map(c => `#${c.name}`).join(", ")}`
+        : "";
+      return { content: [{ type: "text", text: `Channel #${normalized} created${nameNote}.${description ? ` Purpose: ${description}` : ""}${similarNote}` }] };
     }
   );
 
-  server.tool("list_channels", "List all available channels.", {}, async () => {
-    const channels = await db.listChannels();
-    const formatted = channels.map((c) => `#${c.name}${c.description ? ` - ${c.description}` : ""}`).join("\n");
-    return { content: [{ type: "text", text: `Channels:\n${formatted}` }] };
-  });
+  server.tool(
+    "list_channels",
+    "List all channels with activity stats (message count, last activity, participants). Use this to find the right channel before sending messages.",
+    {},
+    async () => {
+      const channels = await db.listChannelsWithActivity();
+      if (channels.length === 0) return { content: [{ type: "text", text: "No channels exist yet." }] };
+      const formatted = channels.map((c) => {
+        const parts = [`#${c.name}`];
+        if (c.description) parts.push(`- ${c.description}`);
+        if (c.message_count > 0) {
+          parts.push(`(${c.message_count} msgs, last: ${c.last_message_at})`);
+          if (c.active_senders) parts.push(`[participants: ${c.active_senders}]`);
+        } else {
+          parts.push("(empty)");
+        }
+        return parts.join(" ");
+      }).join("\n");
+      return { content: [{ type: "text", text: `Channels:\n${formatted}` }] };
+    }
+  );
+
+  server.tool(
+    "find_channel",
+    "Search for channels by keyword. Matches against channel names and descriptions. Use this when you're not sure which channel to use.",
+    {
+      query: z.string().describe("Keyword to search for in channel names and descriptions"),
+    },
+    async ({ query }) => {
+      const channels = await db.findChannels(query);
+      if (channels.length === 0) {
+        // Suggest listing all channels
+        const allChannels = await db.listChannels();
+        const suggestion = allChannels.length > 0
+          ? `\n\nAvailable channels: ${allChannels.map(c => `#${c.name}`).join(", ")}`
+          : "\n\nNo channels exist yet. Create one with create_channel.";
+        return { content: [{ type: "text", text: `No channels matching "${query}".${suggestion}` }] };
+      }
+      const formatted = channels.map(c => {
+        const parts = [`#${c.name}`];
+        if (c.description) parts.push(`- ${c.description}`);
+        if (c.message_count > 0) parts.push(`(${c.message_count} msgs, last: ${c.last_message_at})`);
+        else parts.push("(empty)");
+        return parts.join(" ");
+      }).join("\n");
+      return { content: [{ type: "text", text: `${channels.length} channel(s) matching "${query}":\n${formatted}` }] };
+    }
+  );
 
   server.tool("list_instances", "See all registered Claude Code instances.", {}, async () => {
     touchHeartbeat();

@@ -218,6 +218,26 @@ li{margin:4px 0}</style></head>
 
   // --- Start ---
 
+  // --- Auto-cleanup: delete data older than 7 days ---
+
+  const CLEANUP_DAYS = parseInt(process.env.CLEANUP_DAYS) || 7;
+  const CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+
+  async function runCleanup() {
+    try {
+      const result = await db.cleanup(CLEANUP_DAYS);
+      const total = result.messages + result.instances + result.shared_data;
+      if (total > 0) {
+        console.log(`[CLEANUP] Removed ${result.messages} messages, ${result.instances} instances, ${result.shared_data} shared data (older than ${CLEANUP_DAYS} days)`);
+      }
+    } catch (err) {
+      console.error(`[CLEANUP] Error: ${err.message}`);
+    }
+  }
+
+  await runCleanup();
+  setInterval(runCleanup, CLEANUP_INTERVAL_MS);
+
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`cross-claude-mcp v2.0.0 listening on port ${PORT}`);
     console.log(`  Mode:            Standard`);
@@ -227,6 +247,7 @@ li{margin:4px 0}</style></head>
     console.log(`  Health:          GET /health`);
     console.log(`  Auth:            ${process.env.MCP_API_KEY ? "Bearer token required" : "NONE (set MCP_API_KEY)"}`);
     console.log(`  Database:        ${process.env.DATABASE_URL ? "PostgreSQL" : "SQLite (local)"}`);
+    console.log(`  Cleanup:         Every ${CLEANUP_DAYS} days (checks hourly)`);
   });
 }
 
