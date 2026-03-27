@@ -121,6 +121,22 @@ async function runTests() {
     assert(toolNames.includes("list_shared_data"), "Has list_shared_data tool");
     console.log(`   Tools found: ${toolNames.join(", ")}`);
 
+    // 2b. List prompts
+    console.log("\n2b. List prompts");
+    const promptsResp = await send("prompts/list", {});
+    const promptNames = promptsResp.result.prompts.map((p) => p.name);
+    assert(promptNames.includes("cross-claude-protocol"), "Has cross-claude-protocol prompt");
+
+    // 2c. Get prompt content
+    console.log("\n2c. Get prompt content");
+    const promptResp = await send("prompts/get", { name: "cross-claude-protocol" });
+    const promptText = promptResp.result.messages[0].content.text;
+    assert(promptText.includes("Session Startup"), "Prompt includes session startup");
+    assert(promptText.includes("Channel Discipline"), "Prompt includes channel discipline");
+    assert(promptText.includes("Message Protocol"), "Prompt includes message protocol");
+    assert(promptText.includes("Connection Behavior"), "Prompt includes connection behavior");
+    assert(promptText.includes("persistent by default"), "Prompt mentions persistent default");
+
     // 3. Register instance
     console.log("\n3. Register instance");
     const regResp = await send("tools/call", {

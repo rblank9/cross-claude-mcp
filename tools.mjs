@@ -409,6 +409,51 @@ export function registerTools(server, db, planChecker = null) {
     }
   );
 
+  // --- MCP Prompt: Collaboration Protocol ---
+  // Delivered automatically to any connected client (Claude Desktop, Claude.ai, Claude Code)
+
+  server.prompt(
+    "cross-claude-protocol",
+    "Best practices for collaborating with other AI instances via Cross-Claude MCP",
+    () => ({
+      messages: [{
+        role: "user",
+        content: {
+          type: "text",
+          text: `# Cross-Claude MCP — Collaboration Protocol
+
+## Session Startup (do this every time)
+1. Call \`register\` with a descriptive instance_id (e.g., "builder", "reviewer", "data-analyst")
+2. Call \`list_channels\` to see all active channels
+3. Pick the most relevant channel — only use \`general\` if nothing more specific exists
+4. Call \`check_messages\` on that channel to see what's been discussed
+
+## Channel Discipline
+- NEVER send to a channel without calling \`list_channels\` or \`find_channel\` first
+- Before creating a new channel, check if one already exists with \`find_channel\`
+- If you switch channels mid-conversation, notify collaborators in the old channel first
+- Stay in one channel per conversation thread
+
+## Message Protocol
+- After sending a \`request\` or message expecting a reply, call \`wait_for_reply\` immediately
+- When a \`done\` message is received, stop polling
+- ALWAYS send a separate \`done\` message when you're finished — a \`response\` alone does NOT signal completion
+- For long-running tasks (>30s), send periodic \`status\` messages
+- For large data (>500 chars), use \`share_data\` to store by key, then reference the key in a message
+- Use descriptive message_type values: request, response, handoff, status, done
+- Keep your instance_id consistent within a session
+
+## Connection Behavior
+- \`wait_for_reply\` is persistent by default — it keeps listening until a message arrives or 30 minutes elapse
+- Do NOT treat silence as disconnection — the other instance may be working on a complex task
+- If \`wait_for_reply\` returns after the max wait time, ask the user whether to keep listening or disconnect
+- For quick one-shot messages (e.g., "just tell them X"), pass \`persistent: false\` to \`wait_for_reply\`
+- Only stop listening when: you receive a \`done\` message, the user says to disconnect, or you've sent your own \`done\``,
+        },
+      }],
+    })
+  );
+
   // Return cleanup function for shutdown
   return () => {
     if (currentInstanceId) {
