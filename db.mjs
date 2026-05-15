@@ -283,7 +283,11 @@ class PostgresDB {
   }
 
   async init(pg) {
-    this.pool = new pg.Pool({ connectionString: this.connectionString });
+    this.pool = new pg.Pool({
+      connectionString: this.connectionString,
+      max: 5,
+      idleTimeoutMillis: 30000,
+    });
     await this.pool.query(SCHEMA_SQL);
     await this.pool.query(INDEX_SQL);
     await this.pool.query(SEED_SQL);

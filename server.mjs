@@ -88,10 +88,25 @@ async function startHTTP(db) {
   // --- Health check + README (no auth) ---
 
   app.get("/health", (req, res) => {
+    const memUsage = process.memoryUsage();
+    const poolStats = db.pool ? {
+      total: db.pool.totalCount,
+      idle: db.pool.idleCount,
+      waiting: db.pool.waitingCount,
+    } : null;
+
     res.json({
       status: "ok",
       server: "cross-claude-mcp",
       version: "2.0.0",
+      memory: {
+        rss: memUsage.rss,
+        heapUsed: memUsage.heapUsed,
+        heapTotal: memUsage.heapTotal,
+      },
+      sessions: sessions.size,
+      sseTransports: sseTransports.size,
+      pool: poolStats,
     });
   });
 
@@ -188,6 +203,30 @@ li{margin:4px 0}</style></head>
 
   const sessions = new Map();
 
+  // TTL eviction: sweep idle sessions every 60s
+  const SESSION_IDLE_MS = 5 * 60 * 1000; // 5 minutes
+  const sweepSessions = () => {
+    const now = Date.now();
+    for (const [sid, entry] of sessions.entries()) {
+      // Check if transport response is destroyed
+      if (entry.transport._response?.destroyed === true) {
+        console.log(`[SESSION EVICT] ${sid} (destroyed)`);
+        entry.cleanup();
+        try { entry.transport.close(); } catch {}
+        sessions.delete(sid);
+        continue;
+      }
+      // Check idle timeout
+      if (now - entry.lastActivity > SESSION_IDLE_MS) {
+        console.log(`[SESSION EVICT] ${sid} (idle ${Math.round((now - entry.lastActivity) / 1000)}s)`);
+        entry.cleanup();
+        try { entry.transport.close(); } catch {}
+        sessions.delete(sid);
+      }
+    }
+  };
+  const sessionSweepInterval = setInterval(sweepSessions, 60_000);
+
   app.post("/mcp", express.json(), async (req, res) => {
     const sessionId = req.headers["mcp-session-id"];
     let session = sessionId ? sessions.get(sessionId) : null;
@@ -201,7 +240,7 @@ li{margin:4px 0}</style></head>
 
       await server.connect(transport);
 
-      const sessionEntry = { server, transport, cleanup };
+      const sessionEntry = { server, transport, cleanup, lastActivity: Date.now() };
 
       transport.onclose = () => {
         const sid = transport.sessionId;
@@ -219,6 +258,8 @@ li{margin:4px 0}</style></head>
       return;
     }
 
+    // Update lastActivity on every request
+    session.lastActivity = Date.now();
     await session.transport.handleRequest(req, res, req.body);
   });
 
@@ -231,6 +272,7 @@ li{margin:4px 0}</style></head>
       return;
     }
 
+    session.lastActivity = Date.now();
     await session.transport.handleRequest(req, res);
   });
 
@@ -250,12 +292,35 @@ li{margin:4px 0}</style></head>
 
   const sseTransports = new Map();
 
+  // TTL eviction: sweep idle SSE transports every 60s
+  const sweepSSE = () => {
+    const now = Date.now();
+    for (const [sid, entry] of sseTransports.entries()) {
+      // Check if transport response is destroyed
+      if (entry.transport._response?.destroyed === true) {
+        console.log(`[SSE EVICT] ${sid} (destroyed)`);
+        entry.cleanup();
+        try { entry.transport.close(); } catch {}
+        sseTransports.delete(sid);
+        continue;
+      }
+      // Check idle timeout
+      if (now - entry.lastActivity > SESSION_IDLE_MS) {
+        console.log(`[SSE EVICT] ${sid} (idle ${Math.round((now - entry.lastActivity) / 1000)}s)`);
+        entry.cleanup();
+        try { entry.transport.close(); } catch {}
+        sseTransports.delete(sid);
+      }
+    }
+  };
+  const sseSweepInterval = setInterval(sweepSSE, 60_000);
+
   app.get("/sse", async (req, res) => {
     const transport = new SSEServerTransport("/messages", res);
     const server = new McpServer({ name: "cross-claude-mcp", version: "2.0.0" });
     const cleanup = registerTools(server, db);
 
-    sseTransports.set(transport.sessionId, { server, transport, cleanup });
+    sseTransports.set(transport.sessionId, { server, transport, cleanup, lastActivity: Date.now() });
 
     transport.onclose = () => {
       cleanup();
@@ -275,6 +340,7 @@ li{margin:4px 0}</style></head>
       return;
     }
 
+    session.lastActivity = Date.now();
     await session.transport.handlePostMessage(req, res, req.body);
   });
 
@@ -298,7 +364,19 @@ li{margin:4px 0}</style></head>
   }
 
   await runCleanup();
-  setInterval(runCleanup, CLEANUP_INTERVAL_MS);
+  const cleanupInterval = setInterval(runCleanup, CLEANUP_INTERVAL_MS);
+
+  // Graceful shutdown: clean up intervals
+  const shutdown = () => {
+    clearInterval(sessionSweepInterval);
+    clearInterval(sseSweepInterval);
+    clearInterval(cleanupInterval);
+    process.exit(0);
+  };
+
+  for (const signal of ["SIGTERM", "SIGINT"]) {
+    process.on(signal, shutdown);
+  }
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`cross-claude-mcp v2.0.0 listening on port ${PORT}`);
