@@ -41,6 +41,30 @@ export function registerTools(server, db, planChecker = null) {
     try { db.heartbeat(currentInstanceId); } catch { /* ignore */ }
   }
 
+  // Per-(channel, instance) read high-water mark. Advanced ONLY when messages are
+  // SHOWN to an instance — never by a send. This closes the "after_id blind spot":
+  // when two instances send near-simultaneously, the one whose message landed with
+  // the HIGHER id would otherwise poll from its own send id and never see the lower-id
+  // message that crossed it (it sits in that instance's "past"), hanging until the
+  // ceiling. We poll from the read cursor instead of trusting a too-high client after_id.
+  // Closure-scoped (per connection/tenant), so it's correctly isolated in SaaS multi-tenant
+  // mode and resets on reconnect/restart — degrading to legacy behavior, never worse.
+  const readCursors = new Map(); // key: `${channel}\0${instance}` -> last shown message id
+  const cursorKey = (channel, instance) => `${channel}\0${instance}`;
+  function effectiveAfter(channel, instance, clientAfterId) {
+    if (!instance) return clientAfterId;
+    const c = readCursors.get(cursorKey(channel, instance));
+    // A cursor we hold is authoritative: a send never advanced it, so a crossing
+    // message still sits above it. Take the lower of the two so we never poll past
+    // an unread message from another instance. No cursor (fresh/post-restart) → trust client.
+    return c === undefined ? clientAfterId : Math.min(c, clientAfterId);
+  }
+  function advanceCursor(channel, instance, lastShownId) {
+    if (!instance || lastShownId === undefined) return;
+    const key = cursorKey(channel, instance);
+    if (lastShownId > (readCursors.get(key) ?? -Infinity)) readCursors.set(key, lastShownId);
+  }
+
   server.tool(
     "register",
     "Register this Claude Code instance with an identity. Call this first before using other tools. Each instance_id must be unique — if another active session already owns that ID, you'll be asked to pick a different name.",
@@ -161,7 +185,7 @@ export function registerTools(server, db, planChecker = null) {
       touchHeartbeat();
       let messages;
       if (instance_id && after_id !== undefined) {
-        messages = await db.getUnread(normalized, after_id, instance_id);
+        messages = await db.getUnread(normalized, effectiveAfter(normalized, instance_id, after_id), instance_id);
       } else if (after_id !== undefined) {
         messages = await db.getMessagesSince(normalized, after_id);
       } else {
@@ -178,6 +202,7 @@ export function registerTools(server, db, planChecker = null) {
       ).join("\n\n---\n\n");
 
       const lastId = messages[messages.length - 1].id;
+      advanceCursor(normalized, instance_id, lastId);
       return {
         content: [{ type: "text", text: `${messages.length} message(s) in #${normalized}:\n\n${formatted}\n\n---\nLast message ID: ${lastId} (use as after_id to poll for new messages)` }],
       };
@@ -198,6 +223,9 @@ export function registerTools(server, db, planChecker = null) {
     },
     async ({ channel, after_id, instance_id, timeout_seconds, poll_interval_seconds, persistent, max_wait_minutes }, extra) => {
       const normalized = normalizeChannelName(channel);
+      // Floor the poll at the read cursor, not the client's after_id, so a message that
+      // crossed our own send (lower id than what we just sent) is still seen. See readCursors.
+      const effAfter = effectiveAfter(normalized, instance_id, after_id);
       const start = Date.now();
       const hardDeadline = start + max_wait_minutes * 60 * 1000;
       const KEEPALIVE_INTERVAL_MS = 30_000; // Send SSE keepalive every 30s to prevent proxy timeout
@@ -234,7 +262,7 @@ export function registerTools(server, db, planChecker = null) {
         while (Date.now() < cycleDeadline && Date.now() < hardDeadline) {
           touchHeartbeat();
           pollCount++;
-          const messages = await db.getUnread(normalized, after_id, instance_id);
+          const messages = await db.getUnread(normalized, effAfter, instance_id);
 
           if (messages.length > 0) {
             const hasDone = messages.some((m) => m.message_type === "done");
@@ -242,6 +270,7 @@ export function registerTools(server, db, planChecker = null) {
               `#${m.id} [${m.message_type}] ${m.sender} (${m.created_at})${m.in_reply_to ? ` (reply to #${m.in_reply_to})` : ""}:\n${m.content}`
             ).join("\n\n---\n\n");
             const lastId = messages[messages.length - 1].id;
+            advanceCursor(normalized, instance_id, lastId);
             return {
               content: [{ type: "text", text: `${messages.length} new message(s) in #${normalized}:\n\n${formatted}\n\n---\nLast message ID: ${lastId}${hasDone ? "\n\nThe other instance signaled DONE -- no further replies expected." : ""}` }],
             };
