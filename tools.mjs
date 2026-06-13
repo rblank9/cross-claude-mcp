@@ -7,6 +7,14 @@ import { z } from "zod";
 import { randomUUID } from "crypto";
 import { normalizeChannelName } from "./db.mjs";
 
+// --- Experimental Claude Code "channels" push (env-gated, reversible) ---
+// When CHANNELS_ENABLED=1, send_message ALSO pushes notifications/claude/channel to
+// the live sessions of OTHER registered instances (event-driven delivery). The
+// existing poll-based wait_for_reply path is untouched and remains the universal
+// fallback for non-channel clients. Off by default.
+const CHANNELS_ENABLED = process.env.CHANNELS_ENABLED === "1";
+const channelSessions = new Map(); // instance_id -> McpServer for that instance's live session
+
 export const STALE_THRESHOLD_SECONDS = 120;
 
 /** Simple check: are two strings within edit distance 2? Good enough for channel name typos. */
@@ -92,9 +100,12 @@ export function registerTools(server, db, planChecker = null) {
 
       if (currentInstanceId && currentInstanceId !== instance_id) {
         await db.markOffline(currentInstanceId);
+        if (CHANNELS_ENABLED) channelSessions.delete(currentInstanceId);
       }
       currentInstanceId = instance_id;
       await db.registerInstance(instance_id, description || null, sessionToken);
+      // Associate this instance with its live session so others can push to it.
+      if (CHANNELS_ENABLED) channelSessions.set(instance_id, server);
 
       // Provide context: active channels and online instances
       const channels = await db.listChannelsWithActivity();
@@ -161,6 +172,19 @@ export function registerTools(server, db, planChecker = null) {
       await db.createChannel(normalized, null);
       touchHeartbeat();
       const id = await db.sendMessage(normalized, sender, content, message_type, in_reply_to || null);
+      // Channels push: deliver inbound to OTHER instances' live sessions (event-driven).
+      if (CHANNELS_ENABLED) {
+        const pushText = `[#${normalized}] ${sender}: ${content}`;
+        for (const [instId, sess] of channelSessions) {
+          if (instId === sender) continue;
+          try {
+            sess.server.notification({
+              method: "notifications/claude/channel",
+              params: { content: pushText, meta: { channel: normalized, sender, id: String(id), message_type } },
+            });
+          } catch { /* best-effort push; never break a send on push failure */ }
+        }
+      }
       const nameNote = normalized !== channel ? ` (normalized from "${channel}")` : "";
       const doneHint = message_type === "response"
         ? `\n\n💡 If this is your final reply, send a follow-up "done" message so the other instance stops polling.`
@@ -536,6 +560,7 @@ export function registerTools(server, db, planChecker = null) {
   return () => {
     if (currentInstanceId) {
       db.markOffline(currentInstanceId);
+      if (CHANNELS_ENABLED) channelSessions.delete(currentInstanceId);
     }
   };
 }

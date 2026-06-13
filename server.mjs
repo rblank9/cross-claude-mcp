@@ -26,7 +26,7 @@ import { InviteCodeOAuthProvider, createAuthorizeSubmitHandler } from "./auth.mj
 async function startStdio(db) {
   const { StdioServerTransport } = await import("@modelcontextprotocol/sdk/server/stdio.js");
 
-  const server = new McpServer({ name: "cross-claude-mcp", version: "2.0.0" });
+  const server = new McpServer({ name: "cross-claude-mcp", version: "2.0.0" }, { capabilities: { tools: {}, experimental: { "claude/channel": {} } } });
   const cleanup = registerTools(server, db);
 
   for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
@@ -235,7 +235,7 @@ li{margin:4px 0}</style></head>
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
       });
-      const server = new McpServer({ name: "cross-claude-mcp", version: "2.0.0" });
+      const server = new McpServer({ name: "cross-claude-mcp", version: "2.0.0" }, { capabilities: { tools: {}, experimental: { "claude/channel": {} } } });
       const cleanup = registerTools(server, db);
 
       await server.connect(transport);
@@ -317,7 +317,7 @@ li{margin:4px 0}</style></head>
 
   app.get("/sse", async (req, res) => {
     const transport = new SSEServerTransport("/messages", res);
-    const server = new McpServer({ name: "cross-claude-mcp", version: "2.0.0" });
+    const server = new McpServer({ name: "cross-claude-mcp", version: "2.0.0" }, { capabilities: { tools: {}, experimental: { "claude/channel": {} } } });
     const cleanup = registerTools(server, db);
 
     sseTransports.set(transport.sessionId, { server, transport, cleanup, lastActivity: Date.now() });
