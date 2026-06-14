@@ -7,6 +7,16 @@ import { z } from "zod";
 import { randomUUID } from "crypto";
 import { normalizeChannelName } from "./db.mjs";
 
+// --- Experimental Claude Code "channels" push (env-gated, reversible) ---
+// When CHANNELS_ENABLED=1, send_message ALSO pushes notifications/claude/channel to the
+// live sessions of instances that have SUBSCRIBED to that channel (explicit opt-in via
+// the `subscribe` tool) — event-driven delivery. The poll-based wait_for_reply path is
+// untouched and remains the universal fallback for non-channel clients. Off by default.
+const CHANNELS_ENABLED = process.env.CHANNELS_ENABLED === "1";
+const channelSessions = new Map();       // instance_id -> McpServer for that instance's live session
+const channelSubscriptions = new Map();  // channel -> Set<instance_id> opted in to pushes
+function subscribersOf(channel) { return channelSubscriptions.get(channel) || new Set(); }
+
 export const STALE_THRESHOLD_SECONDS = 120;
 
 /** Simple check: are two strings within edit distance 2? Good enough for channel name typos. */
@@ -92,9 +102,12 @@ export function registerTools(server, db, planChecker = null) {
 
       if (currentInstanceId && currentInstanceId !== instance_id) {
         await db.markOffline(currentInstanceId);
+        if (CHANNELS_ENABLED) channelSessions.delete(currentInstanceId);
       }
       currentInstanceId = instance_id;
       await db.registerInstance(instance_id, description || null, sessionToken);
+      // Associate this instance with its live session so others can push to it.
+      if (CHANNELS_ENABLED) channelSessions.set(instance_id, server);
 
       // Provide context: active channels and online instances
       const channels = await db.listChannelsWithActivity();
@@ -161,6 +174,21 @@ export function registerTools(server, db, planChecker = null) {
       await db.createChannel(normalized, null);
       touchHeartbeat();
       const id = await db.sendMessage(normalized, sender, content, message_type, in_reply_to || null);
+      // Channels push: deliver inbound to instances SUBSCRIBED to this channel (event-driven).
+      if (CHANNELS_ENABLED) {
+        const pushText = `[#${normalized}] ${sender}: ${content}`;
+        for (const instId of subscribersOf(normalized)) {
+          if (instId === sender) continue;
+          const sess = channelSessions.get(instId);
+          if (!sess) continue; // subscribed but no live session right now
+          try {
+            sess.server.notification({
+              method: "notifications/claude/channel",
+              params: { content: pushText, meta: { channel: normalized, sender, id: String(id), message_type } },
+            });
+          } catch { /* best-effort push; never break a send on push failure */ }
+        }
+      }
       const nameNote = normalized !== channel ? ` (normalized from "${channel}")` : "";
       const doneHint = message_type === "response"
         ? `\n\n💡 If this is your final reply, send a follow-up "done" message so the other instance stops polling.`
@@ -168,6 +196,47 @@ export function registerTools(server, db, planChecker = null) {
       return {
         content: [{ type: "text", text: `Message #${id} sent to #${normalized}${nameNote} as "${sender}" [${message_type}]${warning}${doneHint}` }],
       };
+    }
+  );
+
+  server.tool(
+    "subscribe",
+    "Subscribe this instance to LIVE PUSH delivery for a channel (experimental Channels). After subscribing, messages other instances send to that channel are injected into your session in real time — no polling. Call 'register' first with the same instance_id.",
+    {
+      channel: z.string().describe("Channel to subscribe to (e.g. 'general', 'cro-compare')"),
+      instance_id: z.string().describe("Your instance_id (must match your register)"),
+    },
+    async ({ channel, instance_id }) => {
+      const normalized = normalizeChannelName(channel);
+      if (!normalized) {
+        return { content: [{ type: "text", text: `Invalid channel name "${channel}". Use lowercase letters, numbers, and hyphens.` }] };
+      }
+      currentInstanceId = instance_id;
+      touchHeartbeat();
+      if (CHANNELS_ENABLED) {
+        channelSessions.set(instance_id, server);
+        if (!channelSubscriptions.has(normalized)) channelSubscriptions.set(normalized, new Set());
+        channelSubscriptions.get(normalized).add(instance_id);
+      }
+      const note = CHANNELS_ENABLED
+        ? `✅ Subscribed "${instance_id}" to #${normalized}. Messages to this channel will be pushed to you live. (Use 'unsubscribe' to stop, or 'wait_for_reply' if you prefer polling.)`
+        : `Channels push is disabled on this server (set CHANNELS_ENABLED=1). "${instance_id}" noted for #${normalized}, but delivery falls back to wait_for_reply polling.`;
+      return { content: [{ type: "text", text: note }] };
+    }
+  );
+
+  server.tool(
+    "unsubscribe",
+    "Stop live push delivery for a channel. You can still read it via check_messages / wait_for_reply.",
+    {
+      channel: z.string().describe("Channel to unsubscribe from"),
+      instance_id: z.string().describe("Your instance_id"),
+    },
+    async ({ channel, instance_id }) => {
+      const normalized = normalizeChannelName(channel);
+      const set = channelSubscriptions.get(normalized);
+      if (set) set.delete(instance_id);
+      return { content: [{ type: "text", text: `Unsubscribed "${instance_id}" from #${normalized} (push). Polling still works.` }] };
     }
   );
 
@@ -536,6 +605,10 @@ export function registerTools(server, db, planChecker = null) {
   return () => {
     if (currentInstanceId) {
       db.markOffline(currentInstanceId);
+      if (CHANNELS_ENABLED) {
+        channelSessions.delete(currentInstanceId);
+        for (const set of channelSubscriptions.values()) set.delete(currentInstanceId);
+      }
     }
   };
 }
