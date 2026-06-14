@@ -75,8 +75,17 @@ Claude admin / managed-settings console (same place as the "Channels [Preview]" 
 ```
 
 After it propagates, members relaunch and the plugin channel works with no dev flag.
-(A local-filesystem marketplace's allowlist-eligibility vs a hosted/GitHub marketplace is
-worth confirming empirically.)
+
+**CONFIRMED 2026-06-13 (empirical + binary):** `allowedChannelPlugins` is **server-policy
+only** — read from the remote-fetched `policySettings`, NEVER from a local file. Tested and
+ruled out BOTH `CLAUDE_CODE_MANAGED_SETTINGS_PATH` override AND
+`/Library/Application Support/ClaudeCode/managed-settings.json` (neither honored; banner
+stays "not on the approved channels allowlist"). Binary: settings that ARE file-settable
+(e.g. `strictKnownMarketplaces`) say so explicitly; `allowedChannelPlugins` does not. So it
+is strictly the **Anthropic admin console / org policy** (owner/admin only). The console
+field may be Preview-gated — contact Anthropic support if it isn't visible. Until set
+there, use the **dev-flag door** (`--dangerously-load-development-channels server:cross-claude`),
+which is proven working.
 
 ## Caveats / findings
 
