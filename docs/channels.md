@@ -62,6 +62,13 @@ agnostic `spawn_command` (default `claude`). Peers run DIRECT to Anthropic (the 
 strips inherited `ANTHROPIC_BASE_URL`) — this both dodges a proxy bug and makes them
 natively first-party. Send-only by default; `--listen` loads the channel for receive.
 
+**`--project DIR` — the cross-project specialist.** Launch the peer with another project's
+directory as cwd and it inherits THAT project's CLAUDE.md, memory, MCP servers, skills, and
+hooks — a genuine specialist in a *different* project, which a same-project subagent
+structurally cannot be. This is the primary advantage of spawning a peer over a subagent:
+orchestrate from one project, stand up an expert in another, and have it report back live
+over the channel. Without `--project`, the peer inherits the spawner's own cwd.
+
 ## Admin: enabling the no-flag plugin (`allowedChannelPlugins`)
 
 `allowedChannelPlugins` is **org policy, set server-side ONLY** — read from the remote-fetched
