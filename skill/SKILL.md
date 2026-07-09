@@ -43,6 +43,14 @@ There are exactly two states. Know which one you're in before you say anything t
 
 After your final message in a collaboration, always send a separate `done` message with a brief summary. A `response` is not a `done`. Without it, the other instance polls indefinitely.
 
+## Cross-project changes (MANDATORY)
+
+If a CHANGE (create/edit/commit) belongs to ANOTHER project, do not make it from your own session. Spawn a resident Claude IN that project (`spawn-collaborator --project <path>`) and let IT make and commit the change. That peer loads the target project's CLAUDE.md, memory, MCP servers, skills, and hooks — you do not, and editing its files from outside skips all of that.
+
+This is the general rule. It applies everywhere, not only inside plan-step execution — see "Plan-step cross-project invocation" below for that narrower, `xproj`-flagged case.
+
+**Edge case — global config with no owning project**: edit directly, no spawn needed. Examples: a plain `~/.claude/skills/*/SKILL.md` that is not symlinked from a repo, or other loose global config. Exception within the exception: `~/.claude/CLAUDE.md` itself is edited directly ONLY with the user's explicit authorization.
+
 ## Plan-step cross-project invocation
 
 When executing a plan step that contains an `xproj: <project>` line (on its own line, directly under the step header, before the step body):
