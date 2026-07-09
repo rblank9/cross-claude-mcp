@@ -19,6 +19,40 @@ function subscribersOf(channel) { return channelSubscriptions.get(channel) || ne
 
 export const STALE_THRESHOLD_SECONDS = 120;
 
+const MUTUAL_WAIT_DETECT = process.env.MUTUAL_WAIT_DETECT !== '0';
+const GRACE_MS = 30000; // 30 seconds: consider a wait "long-running" after this
+const activeWaiters = new Map();
+// key: `${tenantKey}\0${channel}\0${instance}` -> { startedAt: Date, token: string }
+
+/**
+ * Pure function: decide whether to yield to a peer in a mutual-wait scenario.
+ * Testability seam for late-waiter-yields logic.
+ *
+ * @param {string} myId - this instance's ID
+ * @param {number} myWaitMs - how long this instance has been waiting
+ * @param {Array<{peerId: string, peerWaitMs: number}>} peers - live, non-ghost peers
+ * @param {number} graceMs - threshold to consider a wait "long-running"
+ * @returns {string|null} - peerId to yield to, or null if no yield decision
+ */
+export function decideYield({ myId, myWaitMs, peers, graceMs }) {
+  // Find first peer that has waited >= graceMs
+  for (const { peerId, peerWaitMs } of peers) {
+    if (peerWaitMs >= graceMs) {
+      // Peer has waited long enough. Do we yield?
+      if (myWaitMs < graceMs) {
+        // I'm the late one (I just entered the grace period, peer was waiting before me)
+        return peerId;
+      }
+      // Both in grace period: tie-break by id (lexicographically GREATER yields)
+      if (myId > peerId) {
+        return peerId;
+      }
+      // else: my id is smaller, so I keep waiting; don't yield
+    }
+  }
+  return null; // No yield condition met
+}
+
 /** Simple check: are two strings within edit distance 2? Good enough for channel name typos. */
 function levenshteinClose(a, b) {
   if (Math.abs(a.length - b.length) > 2) return false;
@@ -69,10 +103,56 @@ export function registerTools(server, db, planChecker = null) {
     // an unread message from another instance. No cursor (fresh/post-restart) → trust client.
     return c === undefined ? clientAfterId : Math.min(c, clientAfterId);
   }
-  function advanceCursor(channel, instance, lastShownId) {
+
+  // Helper functions nested inside registerTools for closure over db, readCursors, etc.
+  async function getTenantKey() {
+    if (db.tenantId) return db.tenantId;
+    if (typeof db.tenantKey === 'function') return await db.tenantKey();
+    return '';
+  }
+
+  function logWaitEvent(type, { channel, instance, elapsedMs, reason }) {
+    const entry = { type, channel, instance, timestamp: new Date().toISOString() };
+    if (elapsedMs !== undefined) entry.elapsedMs = elapsedMs;
+    if (reason) entry.reason = reason;
+    console.error(JSON.stringify(entry));
+  }
+
+  // Resolve the floor of the poll cursor, considering durable read_cursors if available.
+  // Called at the START of each poll operation (check_messages, wait_for_reply).
+  async function resolveFloor(channel, instance, clientAfterId) {
+    // In-memory cursor (hot cache, always synchronous)
+    const inMemoryCursor = readCursors.get(cursorKey(channel, instance));
+
+    // Durable cursor (if db supports it, otherwise undefined)
+    let durableCursor;
+    if (typeof db.getReadCursor === 'function') {
+      durableCursor = await db.getReadCursor(channel, instance);
+    }
+
+    // Floor = minimum of all three sources (never poll past any of them)
+    const floor = Math.min(
+      clientAfterId ?? Infinity,
+      inMemoryCursor ?? Infinity,
+      durableCursor ?? Infinity
+    );
+
+    // Always return a finite number (better-sqlite3/pg reject Infinity)
+    return floor === Infinity ? 0 : floor;
+  }
+
+  async function advanceCursor(channel, instance, lastShownId) {
     if (!instance || lastShownId === undefined) return;
     const key = cursorKey(channel, instance);
-    if (lastShownId > (readCursors.get(key) ?? -Infinity)) readCursors.set(key, lastShownId);
+    const current = readCursors.get(key) ?? -Infinity;
+    // Only advance if strictly monotonic increase
+    if (lastShownId > current) {
+      readCursors.set(key, lastShownId);
+      // Persist to DB if available (feature-detect)
+      if (typeof db.setReadCursor === 'function') {
+        await db.setReadCursor(channel, instance, lastShownId);
+      }
+    }
   }
 
   server.tool(
@@ -254,7 +334,8 @@ export function registerTools(server, db, planChecker = null) {
       touchHeartbeat();
       let messages;
       if (instance_id && after_id !== undefined) {
-        messages = await db.getUnread(normalized, effectiveAfter(normalized, instance_id, after_id), instance_id);
+        const floor = await resolveFloor(normalized, instance_id, after_id);
+        messages = await db.getUnread(normalized, floor, instance_id);
       } else if (after_id !== undefined) {
         messages = await db.getMessagesSince(normalized, after_id);
       } else {
@@ -271,7 +352,7 @@ export function registerTools(server, db, planChecker = null) {
       ).join("\n\n---\n\n");
 
       const lastId = messages[messages.length - 1].id;
-      advanceCursor(normalized, instance_id, lastId);
+      await advanceCursor(normalized, instance_id, lastId);
       return {
         content: [{ type: "text", text: `${messages.length} message(s) in #${normalized}:\n\n${formatted}\n\n---\nLast message ID: ${lastId} (use as after_id to poll for new messages)` }],
       };
@@ -292,14 +373,20 @@ export function registerTools(server, db, planChecker = null) {
     },
     async ({ channel, after_id, instance_id, timeout_seconds, poll_interval_seconds, persistent, max_wait_minutes }, extra) => {
       const normalized = normalizeChannelName(channel);
-      // Floor the poll at the read cursor, not the client's after_id, so a message that
-      // crossed our own send (lower id than what we just sent) is still seen. See readCursors.
-      const effAfter = effectiveAfter(normalized, instance_id, after_id);
+      const tenantKey = await getTenantKey();
+      const waiterKey = `${tenantKey}\0${normalized}\0${instance_id}`;
+      const token = randomUUID();
       const start = Date.now();
       const hardDeadline = start + max_wait_minutes * 60 * 1000;
-      const KEEPALIVE_INTERVAL_MS = 30_000; // Send SSE keepalive every 30s to prevent proxy timeout
+      const KEEPALIVE_INTERVAL_MS = 30_000;
       let lastKeepalive = Date.now();
       let pollCount = 0;
+
+      // === Register this waiter (for late-waiter-yields detection) ===
+      if (MUTUAL_WAIT_DETECT) {
+        activeWaiters.set(waiterKey, { startedAt: start, token });
+        logWaitEvent('wait_enter', { channel: normalized, instance: instance_id });
+      }
 
       async function sendKeepalive() {
         if (!extra?.sendNotification) return;
@@ -325,51 +412,167 @@ export function registerTools(server, db, planChecker = null) {
         lastKeepalive = Date.now();
       }
 
-      while (true) {
-        const cycleDeadline = Date.now() + timeout_seconds * 1000;
+      async function checkYield() {
+        // Run late-waiter-yields detector to break mutual-wait (D2)
+        if (!MUTUAL_WAIT_DETECT) return null; // detector disabled
 
-        while (Date.now() < cycleDeadline && Date.now() < hardDeadline) {
-          touchHeartbeat();
-          pollCount++;
-          const messages = await db.getUnread(normalized, effAfter, instance_id);
+        const elapsedMs = Date.now() - start;
+        const otherWaiters = Array.from(activeWaiters.entries())
+          .filter(([key]) => {
+            const [tk, ch, inst] = key.split('\0');
+            return tk === tenantKey && ch === normalized && inst !== instance_id;
+          });
 
-          if (messages.length > 0) {
-            const hasDone = messages.some((m) => m.message_type === "done");
-            const formatted = messages.map((m) =>
-              `#${m.id} [${m.message_type}] ${m.sender} (${m.created_at})${m.in_reply_to ? ` (reply to #${m.in_reply_to})` : ""}:\n${m.content}`
-            ).join("\n\n---\n\n");
-            const lastId = messages[messages.length - 1].id;
-            advanceCursor(normalized, instance_id, lastId);
+        // Drop stale / dead peer waiters and gather live peer info
+        const livePeers = [];
+        for (const [key, { startedAt }] of otherWaiters) {
+          const [, , peerId] = key.split('\0');
+
+          // Check if peer is still online
+          const peerInst = await db.getInstance(peerId);
+          const peerOnline = peerInst?.status === 'online' && (Date.now() - new Date(peerInst.last_seen).getTime()) / 1000 < STALE_THRESHOLD_SECONDS;
+
+          // Check if wait has crashed (exceeded hard ceiling)
+          const peerWaited = Date.now() - startedAt;
+          const peerIsGhost = peerWaited >= max_wait_minutes * 60 * 1000;
+
+          if (peerOnline && !peerIsGhost) {
+            livePeers.push({ peerId, peerWaitMs: peerWaited });
+          } else if (!peerOnline || peerIsGhost) {
+            // Clean up dead peer from activeWaiters
+            activeWaiters.delete(key);
+          }
+        }
+
+        // Use pure function to decide whether to yield
+        const yieldToPeerId = decideYield({
+          myId: instance_id,
+          myWaitMs: elapsedMs,
+          peers: livePeers,
+          graceMs: GRACE_MS
+        });
+
+        if (yieldToPeerId) {
+          logWaitEvent('mutual_wait_yield', {
+            channel: normalized,
+            instance: instance_id,
+            elapsedMs,
+            reason: `peer ${yieldToPeerId} waiting`
+          });
+          return {
+            content: [{
+              type: "text",
+              text: `🔓 MUTUAL WAIT: peer "${yieldToPeerId}" is already waiting on #${normalized} with nothing queued. Send a message to break the tie instead of waiting.`
+            }]
+          };
+        }
+
+        return null; // No yield condition met
+      }
+
+      try {
+        while (true) {
+          // Re-resolve floor at the START of each cycle (picks up concurrent advances)
+          const floor = await resolveFloor(normalized, instance_id, after_id);
+          const cycleDeadline = Date.now() + timeout_seconds * 1000;
+
+          while (Date.now() < cycleDeadline && Date.now() < hardDeadline) {
+            touchHeartbeat();
+            pollCount++;
+            const messages = await db.getUnread(normalized, floor, instance_id);
+
+            if (messages.length > 0) {
+              const hasDone = messages.some((m) => m.message_type === "done");
+              const formatted = messages.map((m) =>
+                `#${m.id} [${m.message_type}] ${m.sender} (${m.created_at})${m.in_reply_to ? ` (reply to #${m.in_reply_to})` : ""}:\n${m.content}`
+              ).join("\n\n---\n\n");
+              const lastId = messages[messages.length - 1].id;
+              await advanceCursor(normalized, instance_id, lastId);
+              logWaitEvent('wait_exit', {
+                channel: normalized,
+                instance: instance_id,
+                elapsedMs: Date.now() - start,
+                reason: 'message_received'
+              });
+              return {
+                content: [{ type: "text", text: `${messages.length} new message(s) in #${normalized}:\n\n${formatted}\n\n---\nLast message ID: ${lastId}${hasDone ? "\n\nThe other instance signaled DONE -- no further replies expected." : ""}` }],
+              };
+            }
+
+            // Keep SSE stream alive through proxies
+            if (Date.now() - lastKeepalive >= KEEPALIVE_INTERVAL_MS) {
+              await sendKeepalive();
+            }
+
+            // Run checkYield inside inner loop once elapsed >= GRACE (for responsiveness)
+            if (MUTUAL_WAIT_DETECT && (Date.now() - start) >= GRACE_MS) {
+              const yieldResult = await checkYield();
+              if (yieldResult) {
+                logWaitEvent('wait_exit', {
+                  channel: normalized,
+                  instance: instance_id,
+                  elapsedMs: Date.now() - start,
+                  reason: 'mutual_wait_yield'
+                });
+                return yieldResult;
+              }
+            }
+
+            await new Promise((resolve) => setTimeout(resolve, poll_interval_seconds * 1000));
+          }
+
+          // Cycle finished with no messages — check for late-waiter-yields before continuing
+          if (MUTUAL_WAIT_DETECT) {
+            const yieldResult = await checkYield();
+            if (yieldResult) {
+              logWaitEvent('wait_exit', {
+                channel: normalized,
+                instance: instance_id,
+                elapsedMs: Date.now() - start,
+                reason: 'mutual_wait_yield'
+              });
+              return yieldResult;
+            }
+          }
+
+          // If not persistent, return (non-persistent timeout)
+          if (!persistent) {
+            logWaitEvent('wait_exit', {
+              channel: normalized,
+              instance: instance_id,
+              elapsedMs: Date.now() - start,
+              reason: 'timeout_nonpersistent'
+            });
             return {
-              content: [{ type: "text", text: `${messages.length} new message(s) in #${normalized}:\n\n${formatted}\n\n---\nLast message ID: ${lastId}${hasDone ? "\n\nThe other instance signaled DONE -- no further replies expected." : ""}` }],
+              content: [{ type: "text", text: `No new messages in #${normalized} after waiting ${timeout_seconds}s. The other instance may be busy or offline, or the other instance may also be waiting — send a message to break the tie instead of waiting. You can try again, send a message to prompt them, or check list_instances.` }],
             };
           }
 
-          // Keep SSE stream alive through proxies (Railway, mcp-remote)
-          if (Date.now() - lastKeepalive >= KEEPALIVE_INTERVAL_MS) {
-            await sendKeepalive();
+          // Persistent mode: check hard ceiling
+          if (Date.now() >= hardDeadline) {
+            logWaitEvent('wait_exit', {
+              channel: normalized,
+              instance: instance_id,
+              elapsedMs: Date.now() - start,
+              reason: 'hard_ceiling'
+            });
+            const elapsed = Math.round((Date.now() - start) / 60000);
+            return {
+              content: [{ type: "text", text: `No new messages in #${normalized} after ${elapsed} minute(s). The other instance may also be waiting — send a message rather than waiting again, or check list_instances.` }],
+            };
           }
 
-          await new Promise((resolve) => setTimeout(resolve, poll_interval_seconds * 1000));
+          // Persistent mode: restart cycle
+          await sendKeepalive();
         }
-
-        // Cycle finished with no messages
-        if (!persistent) {
-          return {
-            content: [{ type: "text", text: `No new messages in #${normalized} after waiting ${timeout_seconds}s. The other instance may be busy or offline. You can try again or check list_instances.` }],
-          };
+      } finally {
+        // Deregister from activeWaiters if token matches (protects overlapping same-instance waits)
+        if (MUTUAL_WAIT_DETECT) {
+          const entry = activeWaiters.get(waiterKey);
+          if (entry && entry.token === token) {
+            activeWaiters.delete(waiterKey);
+          }
         }
-
-        // Persistent mode: check hard ceiling
-        if (Date.now() >= hardDeadline) {
-          const elapsed = Math.round((Date.now() - start) / 60000);
-          return {
-            content: [{ type: "text", text: `No new messages in #${normalized} after ${elapsed} minute(s). Call wait_for_reply again to keep listening, or disconnect.` }],
-          };
-        }
-
-        // Persistent mode: restart cycle — send keepalive before restarting
-        await sendKeepalive();
       }
     }
   );

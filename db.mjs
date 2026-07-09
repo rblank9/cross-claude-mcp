@@ -43,6 +43,16 @@ const SCHEMA_SQL = `
     used_at TIMESTAMP,
     used_by TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS read_cursors (
+    channel TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    last_read_id INTEGER NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (channel, instance_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_read_cursors_updated ON read_cursors(updated_at);
 `;
 
 const INDEX_SQL = `
@@ -206,6 +216,25 @@ class SqliteDB {
     return this.db.prepare(`SELECT * FROM messages WHERE in_reply_to = ? ORDER BY created_at ASC`).all(messageId);
   }
 
+  getReadCursor(channel, instanceId) {
+    const result = this.db.prepare(
+      `SELECT last_read_id FROM read_cursors WHERE channel = ? AND instance_id = ?`
+    ).get(channel, instanceId);
+    return result ? result.last_read_id : undefined;
+  }
+
+  setReadCursor(channel, instanceId, lastReadId) {
+    // Monotonic upsert: never regress to a lower id
+    this.db.prepare(`
+      INSERT INTO read_cursors (channel, instance_id, last_read_id, updated_at)
+      VALUES (?, ?, ?, datetime('now'))
+      ON CONFLICT(channel, instance_id) DO UPDATE SET
+        last_read_id = max(read_cursors.last_read_id, excluded.last_read_id),
+        updated_at = datetime('now')
+      WHERE excluded.last_read_id >= read_cursors.last_read_id
+    `).run(channel, instanceId, lastReadId);
+  }
+
   listInstances() {
     return this.db.prepare(`SELECT * FROM instances ORDER BY last_seen DESC`).all();
   }
@@ -248,7 +277,9 @@ class SqliteDB {
     const msgs = this.db.prepare(`DELETE FROM messages WHERE created_at < datetime('now', ?)`).run(interval);
     const inst = this.db.prepare(`DELETE FROM instances WHERE last_seen < datetime('now', ?)`).run(interval);
     const data = this.db.prepare(`DELETE FROM shared_data WHERE created_at < datetime('now', ?)`).run(interval);
-    return { messages: msgs.changes, instances: inst.changes, shared_data: data.changes };
+    // Opportunistic cleanup: purge read_cursors older than 30 days (independent of maxAgeDays)
+    const cursors = this.db.prepare(`DELETE FROM read_cursors WHERE updated_at < datetime('now', '-30 days')`).run();
+    return { messages: msgs.changes, instances: inst.changes, shared_data: data.changes, read_cursors: cursors.changes };
   }
 
   purgeAll() {
@@ -432,6 +463,25 @@ class PostgresDB {
     return result.rows;
   }
 
+  async getReadCursor(channel, instanceId) {
+    const result = await this.pool.query(
+      `SELECT last_read_id FROM read_cursors WHERE channel = $1 AND instance_id = $2`,
+      [channel, instanceId]
+    );
+    return result.rows[0]?.last_read_id;
+  }
+
+  async setReadCursor(channel, instanceId, lastReadId) {
+    // Monotonic upsert: never regress to a lower id
+    await this.pool.query(`
+      INSERT INTO read_cursors (channel, instance_id, last_read_id, updated_at)
+      VALUES ($1, $2, $3, NOW())
+      ON CONFLICT(channel, instance_id) DO UPDATE SET
+        last_read_id = GREATEST(read_cursors.last_read_id, EXCLUDED.last_read_id),
+        updated_at = NOW()
+    `, [channel, instanceId, lastReadId]);
+  }
+
   async listInstances() {
     const result = await this.pool.query(`SELECT * FROM instances ORDER BY last_seen DESC`);
     return result.rows;
@@ -480,7 +530,9 @@ class PostgresDB {
     const msgs = await this.pool.query(`DELETE FROM messages WHERE created_at < NOW() - INTERVAL '1 day' * $1`, [maxAgeDays]);
     const inst = await this.pool.query(`DELETE FROM instances WHERE last_seen < NOW() - INTERVAL '1 day' * $1`, [maxAgeDays]);
     const data = await this.pool.query(`DELETE FROM shared_data WHERE created_at < NOW() - INTERVAL '1 day' * $1`, [maxAgeDays]);
-    return { messages: msgs.rowCount, instances: inst.rowCount, shared_data: data.rowCount };
+    // Opportunistic cleanup: purge read_cursors older than 30 days (independent of maxAgeDays)
+    const cursors = await this.pool.query(`DELETE FROM read_cursors WHERE updated_at < NOW() - INTERVAL '30 days'`);
+    return { messages: msgs.rowCount, instances: inst.rowCount, shared_data: data.rowCount, read_cursors: cursors.rowCount };
   }
 
   async purgeAll() {

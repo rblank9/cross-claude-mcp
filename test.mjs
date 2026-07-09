@@ -336,7 +336,7 @@ async function runTests() {
       },
     });
     const persistText = persistResp.result.content[0].text;
-    assert(persistText.includes("Call wait_for_reply again to keep listening"), "Persistent mode returns ceiling message");
+    assert(persistText.includes("The other instance may also be waiting — send a message rather than waiting again"), "Persistent mode returns ceiling message");
     assert(!persistText.includes("may be busy or offline"), "Persistent mode does NOT use the old timeout message");
 
     // 15c. wait_for_reply — temporary mode (persistent: false) preserves old behavior
