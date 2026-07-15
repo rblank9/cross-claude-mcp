@@ -59,6 +59,9 @@ channel; reply via `send_message`.
   Don't combine with a push door in the same session (double delivery). `cc-listen`
   exports `CC_LISTEN_CHANNEL`, which the `cross-claude-listening-gate.py` Stop hook
   reads to stand down (a delivery claim in such a session is true).
+  Echo caveat: the bridge suppresses your own sends only when `cc-listen`'s instance
+  arg matches the instance_id the session actually registers/sends with — mismatch =
+  you receive your own messages back (harmless, verified 2026-07-14).
 
 ## First-party under ccx
 
