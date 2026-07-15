@@ -281,7 +281,7 @@ export function registerTools(server, db, planChecker = null) {
 
   server.tool(
     "subscribe",
-    "Register interest in a channel. The server emits MCP notifications to subscribed live sessions, but turn-based clients (Claude Code CLI, Claude Desktop, claude.ai) do NOT surface those notifications to the model — so subscribing alone is NOT listening, and you will never see a message because of it. The only ways to actually receive messages are: block inside wait_for_reply, or poll check_messages on a later turn. Never tell the user you are 'listening'/'watching'/'subscribed and standing by' on the basis of this call. Call 'register' first with the same instance_id.",
+    "Register interest in a channel. Whether this gets you live delivery depends on how YOUR session was launched. Channels-enabled session (Claude Code started via cc-listen, or with --channels / --dangerously-load-development-channels naming this server): new messages ARE injected into your context live and will wake you when idle. Any OTHER session (the default): your client drops these notifications — subscribing alone is NOT listening, you will never see a message because of it, and your only options are blocking inside wait_for_reply or polling check_messages on a later turn. Only tell the user you are receiving live messages if you KNOW the session was launched channels-enabled; if unsure, assume it was not. Call 'register' first with the same instance_id.",
     {
       channel: z.string().describe("Channel to subscribe to (e.g. 'general', 'cro-compare')"),
       instance_id: z.string().describe("Your instance_id (must match your register)"),
@@ -298,7 +298,7 @@ export function registerTools(server, db, planChecker = null) {
         if (!channelSubscriptions.has(normalized)) channelSubscriptions.set(normalized, new Set());
         channelSubscriptions.get(normalized).add(instance_id);
       }
-      const honesty = `⚠️ IMPORTANT — subscribing is NOT listening. Nothing will be delivered to you passively: your client will not show you channel notifications, and once your turn ends you are deaf to this channel. Do NOT tell the user you are "listening", "watching", "standing by", or "staying subscribed". Your only honest options: (1) call wait_for_reply NOW and stay blocked inside it, or (2) tell the user plainly that you will only see new messages the next time they prompt you and you poll check_messages.`;
+      const honesty = `⚠️ IMPORTANT — whether you will actually receive messages depends on how THIS session was launched. Channels-enabled (cc-listen, or --channels / --dangerously-load-development-channels): live delivery is real — messages will be injected into your context, even while idle. Any other session (assume this if unsure): nothing is delivered passively, and once your turn ends you are deaf to this channel — do NOT tell the user you are "listening", "watching", "standing by", or "staying subscribed"; either call wait_for_reply NOW and stay blocked inside it, or say plainly that you will only see new messages the next time they prompt you and you poll check_messages.`;
       const note = CHANNELS_ENABLED
         ? `Subscribed "${instance_id}" to #${normalized} (interest registered; server-side notifications enabled, but turn-based clients drop them).\n\n${honesty}`
         : `Subscribed "${instance_id}" to #${normalized} (interest registered; server push disabled — CHANNELS_ENABLED is off).\n\n${honesty}`;
@@ -355,14 +355,14 @@ export function registerTools(server, db, planChecker = null) {
       const lastId = messages[messages.length - 1].id;
       await advanceCursor(normalized, instance_id, lastId);
       return {
-        content: [{ type: "text", text: `${messages.length} message(s) in #${normalized}:\n\n${formatted}\n\n---\nLast message ID: ${lastId} (use as after_id to poll for new messages)\nReminder: you only see messages when you poll. If this collaboration is ongoing, either block in wait_for_reply now or tell the user you'll check again next time they prompt you — do not claim to be "listening".` }],
+        content: [{ type: "text", text: `${messages.length} message(s) in #${normalized}:\n\n${formatted}\n\n---\nLast message ID: ${lastId} (use as after_id to poll for new messages)\nReminder: unless this session was launched channels-enabled (cc-listen / --channels), you only see messages when you poll. If this collaboration is ongoing, either block in wait_for_reply now or tell the user you'll check again next time they prompt you — do not claim to be "listening".` }],
       };
     }
   );
 
   server.tool(
     "wait_for_reply",
-    "Block inside this tool call, polling a channel until a new message arrives from another instance. Persistent by default — the call itself keeps polling across cycles until a message arrives, a 'done' signal is received, or max_wait_minutes is reached; pass persistent: false for one-shot polling. Being blocked inside this call is the ONLY state in which 'I am listening / standing by' is a true statement; once it returns and your turn ends, nothing is listening.",
+    "Block inside this tool call, polling a channel until a new message arrives from another instance. Persistent by default — the call itself keeps polling across cycles until a message arrives, a 'done' signal is received, or max_wait_minutes is reached; pass persistent: false for one-shot polling. In a normal session, being blocked inside this call is the ONLY state in which 'I am listening / standing by' is a true statement — once it returns and your turn ends, nothing is listening. (Exception: sessions launched channels-enabled via cc-listen / --channels receive live pushes without this call.)",
     {
       channel: z.string().default("general").describe("Channel to poll"),
       after_id: z.number().describe("Only look for messages after this ID"),

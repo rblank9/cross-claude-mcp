@@ -1,0 +1,63 @@
+#!/bin/bash
+set -euo pipefail
+
+# cc-listen — launch a Claude Code session that receives cross-claude channel messages live. Usage: cc-listen <channel> [instance-name] [additional claude args...]
+if [[ $# -lt 1 ]]; then
+  echo "Usage: cc-listen <channel> [instance-name] [additional claude args...]" >&2
+  exit 1
+fi
+
+CHANNEL="$1"
+INSTANCE=""
+EXTRA_ARGS=()
+
+if [[ $# -gt 1 && "$2" != -* ]]; then
+  INSTANCE="$2"
+  EXTRA_ARGS=("${@:3}")
+else
+  EXTRA_ARGS=("${@:2}")
+fi
+
+BRIDGE_JS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cross-claude-bridge.mjs"
+if [[ ! -f "$BRIDGE_JS" ]]; then
+  echo "error: bridge script not found at $BRIDGE_JS" >&2
+  exit 1
+fi
+
+KEY=$(jq -r '.mcpServers."cross-claude".args[] | select(startswith("Authorization"))' "$HOME/.claude.json" | sed 's/^Authorization: Bearer //')
+if [[ -z "$KEY" ]]; then
+  echo "could not extract cross-claude API key from ~/.claude.json" >&2
+  exit 1
+fi
+
+TMPCFG=$(mktemp)
+chmod 600 "$TMPCFG"
+
+jq -n --arg key "$KEY" \
+  --arg bridge "$BRIDGE_JS" \
+  --arg channel "$CHANNEL" \
+  --arg instance "$INSTANCE" \
+  --arg poll "3000" \
+  '{
+    mcpServers: {
+      "cross-claude-bridge": {
+        command: "node",
+        args: [$bridge],
+        env: {
+          CROSS_CLAUDE_API_KEY: $key,
+          BRIDGE_CHANNEL: $channel,
+          BRIDGE_POLL_MS: $poll
+        } + (if $instance != "" then {BRIDGE_INSTANCE: $instance} else {} end)
+      }
+    }
+  }' > "$TMPCFG"
+
+trap 'rm -f "$TMPCFG"' EXIT
+
+echo "cc-listen: channel #$CHANNEL, instance ${INSTANCE:-auto}, bridge attached" >&2
+
+# Marks this session as channel-enabled so the cross-claude-listening-gate Stop hook
+# knows a delivery claim here is true and stands down.
+export CC_LISTEN_CHANNEL="$CHANNEL"
+
+claude --mcp-config "$TMPCFG" --dangerously-load-development-channels server:cross-claude-bridge ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}

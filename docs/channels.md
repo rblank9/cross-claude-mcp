@@ -27,7 +27,7 @@ universal fallback for non-channel clients.
 - Verified end-to-end (SDK clients, through `mcp-remote`, and a live two-Claude demo on
   prod). Existing test suites stay green with the flag on or off.
 
-## Using it as a Claude Code client — two doors, same backend
+## Using it as a Claude Code client — three doors, same backend
 
 Channels require: (a) first-party Anthropic, (b) org policy `channelsEnabled: true`,
 (c) the channel loaded for the session.
@@ -46,6 +46,19 @@ Channels require: (a) first-party Anthropic, (b) org policy `channelsEnabled: tr
 
 Then in-session: `register` + `subscribe(channel)` → you receive live pushes for that
 channel; reply via `send_message`.
+
+- **Bridge door (durable, zero in-session setup — added 2026-07-14):**
+  `bridge/cc-listen <channel> [instance] [claude args...]` launches a session with
+  `bridge/cross-claude-bridge.mjs` attached as a local stdio channel server. The bridge
+  POLLS the REST API (`GET /api/messages/:channel?after_id=N`, 3s default) and re-emits
+  each new message as `notifications/claude/channel`. Trade-offs vs the push doors:
+  + survives server redeploys (DB-backed, not in-memory session maps)
+  + delivers ALL messages, including REST-API sends that never trigger native push
+  + no register/subscribe needed in-session; delivery starts at launch
+  − ~3s latency; one node poller per listening session
+  Don't combine with a push door in the same session (double delivery). `cc-listen`
+  exports `CC_LISTEN_CHANNEL`, which the `cross-claude-listening-gate.py` Stop hook
+  reads to stand down (a delivery claim in such a session is true).
 
 ## First-party under ccx
 
@@ -113,3 +126,13 @@ and the plugin channel loads clean.
   but a real optimizer bug worth a dedicated fix if headless-claude-through-broker is wanted.
 - A channel push arriving at an idle CC session auto-wakes a turn (no polling). Each push =
   one receiver turn (tokens) — explicit-subscribe targeting bounds the fan-out.
+- **Native-push fragility (confirmed 2026-07-14):** `subscribe` registrations live in the
+  server process's memory. Every Railway redeploy/restart silently drops ALL subscriptions —
+  receivers stay "subscribed" in their own belief but receive nothing until they re-subscribe
+  over a fresh connection. The bridge door is immune (DB poll).
+- **REST sends don't push (2026-07-14):** `POST /api/messages` writes straight to the DB
+  (`rest-api.mjs`) and never runs the `send_message` tool's push loop (`tools.mjs`). Native-push
+  subscribers never hear REST-originated messages; bridge listeners do.
+- **Re-verified on CC 2.1.210 (2026-07-14):** both the dev-flag native door and the bridge
+  door wake an idle session; `--mcp-config` works as the channel's server source, but
+  `--strict-mcp-config` breaks `server:` name resolution — omit strict.
