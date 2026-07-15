@@ -281,7 +281,7 @@ export function registerTools(server, db, planChecker = null) {
 
   server.tool(
     "subscribe",
-    "Subscribe this instance to LIVE PUSH delivery for a channel (experimental Channels). After subscribing, messages other instances send to that channel are injected into your session in real time — no polling. Call 'register' first with the same instance_id.",
+    "Register interest in a channel. The server emits MCP notifications to subscribed live sessions, but turn-based clients (Claude Code CLI, Claude Desktop, claude.ai) do NOT surface those notifications to the model — so subscribing alone is NOT listening, and you will never see a message because of it. The only ways to actually receive messages are: block inside wait_for_reply, or poll check_messages on a later turn. Never tell the user you are 'listening'/'watching'/'subscribed and standing by' on the basis of this call. Call 'register' first with the same instance_id.",
     {
       channel: z.string().describe("Channel to subscribe to (e.g. 'general', 'cro-compare')"),
       instance_id: z.string().describe("Your instance_id (must match your register)"),
@@ -298,16 +298,17 @@ export function registerTools(server, db, planChecker = null) {
         if (!channelSubscriptions.has(normalized)) channelSubscriptions.set(normalized, new Set());
         channelSubscriptions.get(normalized).add(instance_id);
       }
+      const honesty = `⚠️ IMPORTANT — subscribing is NOT listening. Nothing will be delivered to you passively: your client will not show you channel notifications, and once your turn ends you are deaf to this channel. Do NOT tell the user you are "listening", "watching", "standing by", or "staying subscribed". Your only honest options: (1) call wait_for_reply NOW and stay blocked inside it, or (2) tell the user plainly that you will only see new messages the next time they prompt you and you poll check_messages.`;
       const note = CHANNELS_ENABLED
-        ? `✅ Subscribed "${instance_id}" to #${normalized}. Messages to this channel will be pushed to you live. (Use 'unsubscribe' to stop, or 'wait_for_reply' if you prefer polling.)`
-        : `Channels push is disabled on this server (set CHANNELS_ENABLED=1). "${instance_id}" noted for #${normalized}, but delivery falls back to wait_for_reply polling.`;
+        ? `Subscribed "${instance_id}" to #${normalized} (interest registered; server-side notifications enabled, but turn-based clients drop them).\n\n${honesty}`
+        : `Subscribed "${instance_id}" to #${normalized} (interest registered; server push disabled — CHANNELS_ENABLED is off).\n\n${honesty}`;
       return { content: [{ type: "text", text: note }] };
     }
   );
 
   server.tool(
     "unsubscribe",
-    "Stop live push delivery for a channel. You can still read it via check_messages / wait_for_reply.",
+    "Remove this instance's subscription record for a channel. You can still read the channel via check_messages / wait_for_reply.",
     {
       channel: z.string().describe("Channel to unsubscribe from"),
       instance_id: z.string().describe("Your instance_id"),
@@ -316,7 +317,7 @@ export function registerTools(server, db, planChecker = null) {
       const normalized = normalizeChannelName(channel);
       const set = channelSubscriptions.get(normalized);
       if (set) set.delete(instance_id);
-      return { content: [{ type: "text", text: `Unsubscribed "${instance_id}" from #${normalized} (push). Polling still works.` }] };
+      return { content: [{ type: "text", text: `Unsubscribed "${instance_id}" from #${normalized}. Polling via check_messages / wait_for_reply still works.` }] };
     }
   );
 
@@ -354,14 +355,14 @@ export function registerTools(server, db, planChecker = null) {
       const lastId = messages[messages.length - 1].id;
       await advanceCursor(normalized, instance_id, lastId);
       return {
-        content: [{ type: "text", text: `${messages.length} message(s) in #${normalized}:\n\n${formatted}\n\n---\nLast message ID: ${lastId} (use as after_id to poll for new messages)` }],
+        content: [{ type: "text", text: `${messages.length} message(s) in #${normalized}:\n\n${formatted}\n\n---\nLast message ID: ${lastId} (use as after_id to poll for new messages)\nReminder: you only see messages when you poll. If this collaboration is ongoing, either block in wait_for_reply now or tell the user you'll check again next time they prompt you — do not claim to be "listening".` }],
       };
     }
   );
 
   server.tool(
     "wait_for_reply",
-    "Poll a channel until a new message arrives from another instance. Persistent by default — keeps listening across multiple poll cycles until a message arrives, a 'done' signal is received, or max_wait_minutes is reached. Pass persistent: false for one-shot polling (original behavior).",
+    "Block inside this tool call, polling a channel until a new message arrives from another instance. Persistent by default — the call itself keeps polling across cycles until a message arrives, a 'done' signal is received, or max_wait_minutes is reached; pass persistent: false for one-shot polling. Being blocked inside this call is the ONLY state in which 'I am listening / standing by' is a true statement; once it returns and your turn ends, nothing is listening.",
     {
       channel: z.string().default("general").describe("Channel to poll"),
       after_id: z.number().describe("Only look for messages after this ID"),
