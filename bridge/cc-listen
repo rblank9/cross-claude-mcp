@@ -46,6 +46,7 @@ jq -n --arg key "$KEY" \
         env: {
           CROSS_CLAUDE_API_KEY: $key,
           BRIDGE_CHANNEL: $channel,
+          BRIDGE_AUTOSTART: "1",
           BRIDGE_POLL_MS: $poll
         } + (if $instance != "" then {BRIDGE_INSTANCE: $instance} else {} end)
       }

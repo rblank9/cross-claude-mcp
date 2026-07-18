@@ -20,9 +20,13 @@ function subscribersOf(channel) { return channelSubscriptions.get(channel) || ne
 export const STALE_THRESHOLD_SECONDS = 120;
 
 const MUTUAL_WAIT_DETECT = process.env.MUTUAL_WAIT_DETECT !== '0';
-const GRACE_MS = 30000; // 30 seconds: consider a wait "long-running" after this
+const GRACE_MS = parseInt(process.env.MUTUAL_WAIT_GRACE_MS) || 30000; // consider a wait "long-running" after this (overridable for tests)
+// SaaS insurance: cap concurrent waits per tenant so one tenant can't monopolize poll load.
+const MAX_WAITS_PER_TENANT = Math.max(1, parseInt(process.env.MAX_WAITS_PER_TENANT) || 100);
 const activeWaiters = new Map();
-// key: `${tenantKey}\0${channel}\0${instance}` -> { startedAt: Date, token: string }
+// key: `${tenantKey}\0${channel}\0${instance}` -> { startedAt: Date, token: string, role: 'active'|'parked' }
+// role 'parked' waiters still receive delivery but are NOT counted as a mutual-wait party:
+// they never appear in another waiter's peer list, and they themselves never yield.
 
 /**
  * Pure function: decide whether to yield to a peer in a mutual-wait scenario.
@@ -362,7 +366,7 @@ export function registerTools(server, db, planChecker = null) {
 
   server.tool(
     "wait_for_reply",
-    "Block inside this tool call, polling a channel until a new message arrives from another instance. Persistent by default — the call itself keeps polling across cycles until a message arrives, a 'done' signal is received, or max_wait_minutes is reached; pass persistent: false for one-shot polling. In a normal session, being blocked inside this call is the ONLY state in which 'I am listening / standing by' is a true statement — once it returns and your turn ends, nothing is listening. (Exception: sessions launched channels-enabled via cc-listen / --channels receive live pushes without this call.)",
+    "Block inside this tool call, polling a channel until a new message arrives from another instance. Persistent by default — the call itself keeps polling across cycles until a message arrives, a 'done' signal is received, or max_wait_minutes is reached (default 24h); pass persistent: false for one-shot polling.\n\nBEING BACKGROUNDED IS EXPECTED AND IS THE LISTEN: Claude Code auto-backgrounds any MCP call that runs past ~120s. When that happens this wait keeps running and genuinely WAKES your session when a message arrives — that is real listening, not a failure. So 'a background wait is live and will wake me when a message arrives (until <expiry>)' is a TRUE statement. Once this call RETURNS (message, done, or ceiling) the wait is over: you are deaf until you start another. (Sessions launched channels-enabled via cc-listen / --channels get live pushes without this call.)\n\nROLE: pass role='parked' if you are a background/worker agent who wants to keep listening but must never pull an active coordinator out of ITS wait. Parked waiters still receive every message; they just don't count as a mutual-wait party. Default role='active'.\n\nONE WAIT PER CHANNEL: starting a new wait on a channel you're already waiting on supersedes the old one (the old call returns a clear 'superseded' result). No stacking.",
     {
       channel: z.string().default("general").describe("Channel to poll"),
       after_id: z.number().describe("Only look for messages after this ID"),
@@ -370,9 +374,10 @@ export function registerTools(server, db, planChecker = null) {
       timeout_seconds: z.number().default(90).describe("Seconds per poll cycle (default: 90)"),
       poll_interval_seconds: z.number().default(5).describe("Seconds between polls within a cycle (default: 5)"),
       persistent: z.boolean().default(true).describe("Keep listening across poll cycles until a message arrives (default: true). Pass false for one-shot polling."),
-      max_wait_minutes: z.number().default(30).describe("Hard ceiling in minutes for persistent mode (default: 30)"),
+      max_wait_minutes: z.number().default(1440).describe("Hard ceiling in minutes for persistent mode (default: 1440 = 24h). An idle waiter costs one DB poll every few seconds and zero tokens until woken."),
+      role: z.enum(["active", "parked"]).default("active").describe("'active' (default) = a normal coordinator; counts as a mutual-wait party. 'parked' = a background listener that receives every message but never counts as a mutual-wait party, so it can never bounce an active waiter out of its wait and never yields itself."),
     },
-    async ({ channel, after_id, instance_id, timeout_seconds, poll_interval_seconds, persistent, max_wait_minutes }, extra) => {
+    async ({ channel, after_id, instance_id, timeout_seconds, poll_interval_seconds, persistent, max_wait_minutes, role }, extra) => {
       const normalized = normalizeChannelName(channel);
       const tenantKey = await getTenantKey();
       const waiterKey = `${tenantKey}\0${normalized}\0${instance_id}`;
@@ -382,11 +387,29 @@ export function registerTools(server, db, planChecker = null) {
       const KEEPALIVE_INTERVAL_MS = 30_000;
       let lastKeepalive = Date.now();
       let pollCount = 0;
+      const isParked = role === "parked";
+
+      // === SaaS insurance: reject if this tenant is already at its concurrent-wait ceiling ===
+      if (MUTUAL_WAIT_DETECT) {
+        let tenantWaits = 0;
+        for (const key of activeWaiters.keys()) {
+          if (key.split('\0')[0] === tenantKey) tenantWaits++;
+        }
+        // A superseding wait for an existing (tenant,channel,instance) key doesn't add load —
+        // only count as over-ceiling if this is a genuinely new key.
+        if (tenantWaits >= MAX_WAITS_PER_TENANT && !activeWaiters.has(waiterKey)) {
+          return {
+            content: [{ type: "text", text: `⚠️ Too many concurrent waits for this account (${tenantWaits}/${MAX_WAITS_PER_TENANT}). Let an existing wait finish, or poll with check_messages instead.` }],
+          };
+        }
+      }
 
       // === Register this waiter (for late-waiter-yields detection) ===
+      // One wait per (tenant, channel, instance): overwriting the map entry with a fresh token
+      // supersedes any prior wait on the same key — the old loop detects the token change and returns.
       if (MUTUAL_WAIT_DETECT) {
-        activeWaiters.set(waiterKey, { startedAt: start, token });
-        logWaitEvent('wait_enter', { channel: normalized, instance: instance_id });
+        activeWaiters.set(waiterKey, { startedAt: start, token, role });
+        logWaitEvent('wait_enter', { channel: normalized, instance: instance_id, reason: role });
       }
 
       async function sendKeepalive() {
@@ -417,30 +440,33 @@ export function registerTools(server, db, planChecker = null) {
         // Run late-waiter-yields detector to break mutual-wait (D2)
         if (!MUTUAL_WAIT_DETECT) return null; // detector disabled
 
+        // A parked waiter is not a mutual-wait party — it never yields.
+        if (isParked) return null;
+
         const elapsedMs = Date.now() - start;
         const otherWaiters = Array.from(activeWaiters.entries())
-          .filter(([key]) => {
+          .filter(([key, entry]) => {
             const [tk, ch, inst] = key.split('\0');
-            return tk === tenantKey && ch === normalized && inst !== instance_id;
+            // Exclude parked peers: they receive delivery but never count as a mutual-wait party,
+            // so they must never cause an active waiter to yield.
+            return tk === tenantKey && ch === normalized && inst !== instance_id && entry.role !== 'parked';
           });
 
-        // Drop stale / dead peer waiters and gather live peer info
+        // Drop stale / dead peer waiters and gather live peer info.
+        // Ghost detection is heartbeat-based (STALE_THRESHOLD), NOT wait-age: with a 24h ceiling a
+        // wait-age check would keep a crashed peer "alive" for 24h. A live waiter heartbeats every
+        // poll; a crashed one stops, so peerOnline goes false within STALE_THRESHOLD_SECONDS.
         const livePeers = [];
         for (const [key, { startedAt }] of otherWaiters) {
           const [, , peerId] = key.split('\0');
 
-          // Check if peer is still online
           const peerInst = await db.getInstance(peerId);
           const peerOnline = peerInst?.status === 'online' && (Date.now() - new Date(peerInst.last_seen).getTime()) / 1000 < STALE_THRESHOLD_SECONDS;
 
-          // Check if wait has crashed (exceeded hard ceiling)
-          const peerWaited = Date.now() - startedAt;
-          const peerIsGhost = peerWaited >= max_wait_minutes * 60 * 1000;
-
-          if (peerOnline && !peerIsGhost) {
-            livePeers.push({ peerId, peerWaitMs: peerWaited });
-          } else if (!peerOnline || peerIsGhost) {
-            // Clean up dead peer from activeWaiters
+          if (peerOnline) {
+            livePeers.push({ peerId, peerWaitMs: Date.now() - startedAt });
+          } else {
+            // Peer's heartbeat is stale (crashed or gone) — evict from the waiter pool.
             activeWaiters.delete(key);
           }
         }
@@ -463,7 +489,7 @@ export function registerTools(server, db, planChecker = null) {
           return {
             content: [{
               type: "text",
-              text: `🔓 MUTUAL WAIT: peer "${yieldToPeerId}" is already waiting on #${normalized} with nothing queued. Send a message to break the tie instead of waiting.`
+              text: `🔓 MUTUAL WAIT: peer "${yieldToPeerId}" is also waiting on #${normalized}, so neither of you will speak first. Send a message to break the tie instead of waiting. (If "${yieldToPeerId}" is a background/worker agent that should never bounce you, have it wait with role='parked'.)`
             }]
           };
         }
@@ -471,13 +497,31 @@ export function registerTools(server, db, planChecker = null) {
         return null; // No yield condition met
       }
 
+      // Snapshot the poll floor ONCE at entry and never re-resolve it. If a sibling turn's
+      // check_messages advances the durable cursor mid-wait, re-resolving would raise our floor
+      // and skip the messages between the old and new floor (the cursor-swallow bug). Snapshotting
+      // re-permits duplicate delivery within THIS instance (a message may be seen by both
+      // check_messages and this wait) — hearing twice beats sleeping through. Cross-instance
+      // de-dup is unaffected: floors are per-instance.
+      const floor = await resolveFloor(normalized, instance_id, after_id);
+
       try {
         while (true) {
-          // Re-resolve floor at the START of each cycle (picks up concurrent advances)
-          const floor = await resolveFloor(normalized, instance_id, after_id);
           const cycleDeadline = Date.now() + timeout_seconds * 1000;
 
           while (Date.now() < cycleDeadline && Date.now() < hardDeadline) {
+            // One-wait enforcement: if a newer wait for the same (tenant, channel, instance) has
+            // replaced our activeWaiters entry, this wait has been superseded — return cleanly so
+            // waits never stack or tangle.
+            if (MUTUAL_WAIT_DETECT) {
+              const cur = activeWaiters.get(waiterKey);
+              if (cur && cur.token !== token) {
+                logWaitEvent('wait_exit', { channel: normalized, instance: instance_id, elapsedMs: Date.now() - start, reason: 'superseded' });
+                return {
+                  content: [{ type: "text", text: `This wait on #${normalized} was superseded by a newer wait_for_reply from "${instance_id}" on the same channel. Only the newest wait stays live — this one has stopped, nothing was lost, and the newer wait is listening.` }],
+                };
+              }
+            }
             touchHeartbeat();
             pollCount++;
             const messages = await db.getUnread(normalized, floor, instance_id);
@@ -795,9 +839,11 @@ export function registerTools(server, db, planChecker = null) {
 - Keep your instance_id consistent within a session
 
 ## Connection Behavior
-- \`wait_for_reply\` is persistent by default — it keeps listening until a message arrives or 30 minutes elapse
+- \`wait_for_reply\` is persistent by default — it keeps listening until a message arrives, a \`done\` is received, or \`max_wait_minutes\` (default 24h) elapses
+- Being auto-backgrounded past ~120s is EXPECTED and IS the listen: a backgrounded wait keeps running and wakes your session when a message arrives. "A background wait is live and will wake me when a message arrives (until <expiry>)" is a true statement; once the call returns you are deaf until you start another wait
+- ONE wait per channel: starting a new wait on a channel you're already waiting on supersedes the old one — no stacking
+- ROLES: an active coordinator waits with \`role='active'\` (default); a background/worker agent that must never pull the coordinator out of its wait should use \`role='parked'\` — parked agents still receive every message but never count as a mutual-wait party
 - Do NOT treat silence as disconnection — the other instance may be working on a complex task
-- If \`wait_for_reply\` returns after the max wait time, ask the user whether to keep listening or disconnect
 - For quick one-shot messages (e.g., "just tell them X"), pass \`persistent: false\` to \`wait_for_reply\`
 - Only stop listening when: you receive a \`done\` message, the user says to disconnect, or you've sent your own \`done\``,
         },

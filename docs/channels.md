@@ -47,21 +47,32 @@ Channels require: (a) first-party Anthropic, (b) org policy `channelsEnabled: tr
 Then in-session: `register` + `subscribe(channel)` → you receive live pushes for that
 channel; reply via `send_message`.
 
-- **Bridge door (durable, zero in-session setup — added 2026-07-14):**
-  `bridge/cc-listen <channel> [instance] [claude args...]` launches a session with
-  `bridge/cross-claude-bridge.mjs` attached as a local stdio channel server. The bridge
-  POLLS the REST API (`GET /api/messages/:channel?after_id=N`, 3s default) and re-emits
-  each new message as `notifications/claude/channel`. Trade-offs vs the push doors:
+- **Bridge door (durable, channel-less — added 2026-07-14, made channel-less 2026-07-18):**
+  `bridge/cross-claude-bridge.mjs` is a local stdio MCP server that PUSHES
+  `notifications/claude/channel` by polling the REST API
+  (`GET /api/messages/:channel?after_id=N`, 5s default). Trade-offs vs the push doors:
   + survives server redeploys (DB-backed, not in-memory session maps)
   + delivers ALL messages, including REST-API sends that never trigger native push
-  + no register/subscribe needed in-session; delivery starts at launch
-  − ~3s latency; one node poller per listening session
-  Don't combine with a push door in the same session (double delivery). `cc-listen`
-  exports `CC_LISTEN_CHANNEL`, which the `cross-claude-listening-gate.py` Stop hook
-  reads to stand down (a delivery claim in such a session is true).
-  Echo caveat: the bridge suppresses your own sends only when `cc-listen`'s instance
-  arg matches the instance_id the session actually registers/sends with — mismatch =
+  + delivery is chosen LIVE, mid-session (see below) — no longer launch-only
+  − ~5s latency; one node poll loop per listening channel
+  Don't combine with a push door on the same channel in the same session (double delivery).
+  When launched via `cc-listen`, it exports `CC_LISTEN_CHANNEL`, which the
+  `cross-claude-listening-gate.py` Stop hook reads to stand down (a delivery claim there is true).
+  Echo caveat: the bridge suppresses your own sends only when its `BRIDGE_INSTANCE`
+  matches the instance_id the session actually registers/sends with — mismatch =
   you receive your own messages back (harmless, verified 2026-07-14).
+
+  **Mid-session control tools (channel-less bridge).** The bridge starts idle (no channel)
+  and exposes three tools so a session turns delivery on/off live, without relaunching:
+  - `listen_live(channel)` — start a push loop for `channel` (real live listening from now on;
+    call again for more channels — multiple run at once).
+  - `stop_listening(channel)` — stop that channel's push loop.
+  - `delivery_status()` — best-effort report of which channels are live-pushing vs poll-only.
+    It reports what the bridge has *running*, not proof of end-to-end delivery, and does not
+    know about a session's own backgrounded `wait_for_reply` (only that session does).
+
+  `cc-listen <channel> [instance]` still works: it sets `BRIDGE_CHANNEL` + `BRIDGE_AUTOSTART=1`
+  so the bridge auto-starts that one channel at launch (sugar over the channel-less core).
 
 ## First-party under ccx
 

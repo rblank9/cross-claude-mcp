@@ -8,8 +8,12 @@
  */
 
 import { createDB } from './db.mjs';
-import { registerTools, decideYield } from './tools.mjs';
 import { randomUUID } from 'crypto';
+
+// Speed up the mutual-wait GRACE window for integration tests (production default is 30s).
+// Must be set before tools.mjs is loaded (GRACE_MS is read at module init).
+process.env.MUTUAL_WAIT_GRACE_MS ||= '150';
+const { registerTools, decideYield } = await import('./tools.mjs');
 
 let testsPassed = 0;
 let testsFailed = 0;
@@ -211,6 +215,110 @@ await test('CHANGE C: Timeout messages mention mutual-wait possibility', async (
   const text = result.content[0].text;
   const hasMutualWaitCopy = text.includes('The other instance may also be waiting');
   assert(hasMutualWaitCopy, 'Hard-deadline timeout message mentions mutual-wait possibility');
+});
+
+// ============ WS1: PARKED ROLE + SINGLE-WAIT + CURSOR-SWALLOW + GHOST-BY-HEARTBEAT ============
+
+function makeHandlers(database = db) {
+  const handlers = {};
+  registerTools({ tool: (n, _d, _s, fn) => { handlers[n] = fn; }, prompt: () => {} }, database);
+  return handlers;
+}
+const rnd = () => Math.random().toString(36).slice(2, 8);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// NOTE: these tests call the tool handlers DIRECTLY (bypassing MCP/zod), so zod schema defaults
+// are NOT applied — every wait_for_reply call must pass a complete param set (esp. max_wait_minutes,
+// or hardDeadline becomes NaN and the poll loop is skipped).
+
+await test('WS1-D1: parked peers do NOT pull an active conductor out of its wait', async () => {
+  const ch = `topo-parked-${rnd()}`;
+  const conductor = `zzz-conductor-${rnd()}`;
+  const w1 = `aaa-worker-${rnd()}`;
+  const w2 = `aaa-worker-${rnd()}`;
+  for (const id of [conductor, w1, w2]) await db.registerInstance(id, null, randomUUID());
+
+  const hW1 = makeHandlers(), hW2 = makeHandlers(), hC = makeHandlers();
+  // Two workers park first and stay registered through the conductor's decision window.
+  const pW1 = hW1.wait_for_reply({ channel: ch, after_id: 1e9, instance_id: w1, timeout_seconds: 1.5, poll_interval_seconds: 0.05, persistent: false, max_wait_minutes: 0.1, role: 'parked' });
+  const pW2 = hW2.wait_for_reply({ channel: ch, after_id: 1e9, instance_id: w2, timeout_seconds: 1.5, poll_interval_seconds: 0.05, persistent: false, max_wait_minutes: 0.1, role: 'parked' });
+  await sleep(220); // workers pass the (test-shortened) 150ms GRACE
+  const rC = await hC.wait_for_reply({ channel: ch, after_id: 1e9, instance_id: conductor, timeout_seconds: 0.4, poll_interval_seconds: 0.05, persistent: false, max_wait_minutes: 0.1, role: 'active' });
+  await Promise.all([pW1, pW2]);
+  assert(!rC.content[0].text.includes('MUTUAL WAIT'), 'Active conductor does NOT yield to two parked peers (parked = not a mutual-wait party)');
+});
+
+await test('WS1-D2: forgotten role flag (peers default active) → conductor yields exactly as today', async () => {
+  const ch = `topo-active-${rnd()}`;
+  const conductor = `zzz-conductor-${rnd()}`;
+  const w1 = `aaa-worker-${rnd()}`;
+  for (const id of [conductor, w1]) await db.registerInstance(id, null, randomUUID());
+  const hW1 = makeHandlers(), hC = makeHandlers();
+  // role omitted → 'active' (the safe default when the flag is forgotten)
+  const pW1 = hW1.wait_for_reply({ channel: ch, after_id: 1e9, instance_id: w1, timeout_seconds: 1.5, poll_interval_seconds: 0.05, persistent: false, max_wait_minutes: 0.1, role: 'active' });
+  await sleep(220);
+  const rC = await hC.wait_for_reply({ channel: ch, after_id: 1e9, instance_id: conductor, timeout_seconds: 0.4, poll_interval_seconds: 0.05, persistent: false, max_wait_minutes: 0.1, role: 'active' });
+  await pW1;
+  assert(rC.content[0].text.includes('MUTUAL WAIT'), 'With an active peer past GRACE, the greater-id conductor yields — unchanged from today (safe default)');
+});
+
+await test('WS1-E: single-wait — a newer wait supersedes the older one on the same channel', async () => {
+  const ch = `supersede-${rnd()}`;
+  const dup = `dup-${rnd()}`;
+  await db.registerInstance(dup, null, randomUUID());
+  const h = makeHandlers(); // same session/closure = same instance starting a second wait
+  const pA = h.wait_for_reply({ channel: ch, after_id: 1e9, instance_id: dup, timeout_seconds: 5, poll_interval_seconds: 0.05, persistent: true, max_wait_minutes: 0.1, role: 'active' });
+  await sleep(140);
+  // pB must STAY registered long enough for pA to observe the token change (persistent + real ceiling).
+  const pB = h.wait_for_reply({ channel: ch, after_id: 1e9, instance_id: dup, timeout_seconds: 5, poll_interval_seconds: 0.05, persistent: true, max_wait_minutes: 0.03, role: 'active' });
+  const rA = await pA;
+  await pB;
+  assert(rA.content[0].text.toLowerCase().includes('superseded'), 'Older wait returns a clear "superseded" result once a newer wait starts on the same channel');
+});
+
+await test('WS1-F: cursor-swallow — advancing the read cursor mid-wait does NOT skip a later message', async () => {
+  const ch = `swallow-${rnd()}`;
+  const cs = `cs-${rnd()}`;
+  const peer = `peer-${rnd()}`;
+  await db.registerInstance(cs, null, randomUUID());
+  await db.registerInstance(peer, null, randomUUID());
+  await db.createChannel(ch, null); // messages.channel FK → channels.name
+  const h = makeHandlers();
+  // Baseline sets the durable cursor BELOW the client's high after_id, so the snapshot floor = baseline.
+  const b0 = await db.sendMessage(ch, peer, 'baseline', 'message', null);
+  await db.setReadCursor(ch, cs, b0);
+  const pW = h.wait_for_reply({ channel: ch, after_id: 1e9, instance_id: cs, timeout_seconds: 0.3, poll_interval_seconds: 0.08, persistent: true, max_wait_minutes: 0.1, role: 'active' });
+  await sleep(180);
+  // Sibling turn consumes everything, advancing the durable cursor far past the wait's floor.
+  // Under the OLD re-resolve-each-cycle code this would raise the floor to 1e9 and swallow the next msg.
+  await db.setReadCursor(ch, cs, 1e9);
+  const mx = await db.sendMessage(ch, peer, 'crossing-after-advance', 'message', null);
+  const rW = await pW;
+  assert(rW.content[0].text.includes('crossing-after-advance'),
+    `Wait still fires on message #${mx} despite the cursor advancing to 1e9 (floor snapshotted at ${b0}, never re-resolved)`);
+});
+
+await test('WS1-G: ghost-by-heartbeat — a stale-heartbeat peer is evicted regardless of the 24h ceiling', async () => {
+  const ch = `ghost-${rnd()}`;
+  const conductor = `zzz-cond-${rnd()}`;
+  const ghost = `aaa-ghost-${rnd()}`;
+  await db.registerInstance(conductor, null, randomUUID());
+  await db.registerInstance(ghost, null, randomUUID());
+  // Ghost holds a young wait with the full 24h ceiling — wait-age says "alive", heartbeat says "dead".
+  const hGhost = makeHandlers();
+  const pGhost = hGhost.wait_for_reply({ channel: ch, after_id: 1e9, instance_id: ghost, timeout_seconds: 1.5, poll_interval_seconds: 0.05, persistent: false, max_wait_minutes: 1440, role: 'active' });
+  await sleep(220);
+  // Conductor sees the world through a db whose heartbeat view reports the ghost as long-offline.
+  const staleDb = Object.create(db);
+  staleDb.getInstance = async (id) =>
+    id === ghost
+      ? { instance_id: ghost, status: 'offline', last_seen: new Date(Date.now() - 10 * 60 * 1000).toISOString() }
+      : db.getInstance(id);
+  const hC = makeHandlers(staleDb);
+  const rC = await hC.wait_for_reply({ channel: ch, after_id: 1e9, instance_id: conductor, timeout_seconds: 0.4, poll_interval_seconds: 0.05, persistent: false, max_wait_minutes: 0.1, role: 'active' });
+  await pGhost;
+  assert(!rC.content[0].text.includes('MUTUAL WAIT'),
+    'Peer with a stale heartbeat is evicted from the waiter pool (eviction keyed on heartbeat, not the 24h wait-age ceiling), so the conductor does not yield');
 });
 
 // ============ CLEANUP ============

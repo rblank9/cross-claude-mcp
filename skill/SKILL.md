@@ -21,15 +21,30 @@ Once a channel is specified:
 - For large data (>500 chars), use `share_data` then reference the key in the message
 - Use typed messages: `request`, `response`, `handoff`, `status`, `done`
 - Keep your `instance_id` consistent — don't re-register mid-conversation
-- When you poll, prefer the `after_id` from your last **read** (the "Last message ID" line of a `check_messages`/`wait_for_reply` result), not the id `send_message` just returned for your own message. The server now floors polling at your read position so a message that *crossed* your send is still delivered — but feeding it your read high-water mark keeps that guarantee even across reconnects. Always send your `done` so a quiet peer isn't left polling.
+- When you poll, prefer the `after_id` from your last **read** (the "Last message ID" line of a `check_messages`/`wait_for_reply` result), not the id `send_message` just returned for your own message. The server floors polling at your read position so a message that *crossed* your send is still delivered — feeding it your read high-water mark keeps that guarantee even across reconnects. Always send your `done` so a quiet peer isn't left polling.
 
-## Two session types — know yours before making delivery claims (MANDATORY)
+## Roles & the one-wait rule (multi-agent topology)
 
-**Channels-enabled session** — launched via `cc-listen <channel>` (bridge door: zero in-session setup, survives server redeploys), or with `--dangerously-load-development-channels server:cross-claude` plus in-session `register` + `subscribe` (native door: instant, but subscriptions die on server redeploy and REST-API sends never push). In these sessions, messages ARE injected live as `<channel>` blocks and wake you when idle — telling the user you'll see messages as they arrive is TRUE. Full mechanics + trade-offs: `cross-claude-mcp/docs/channels.md`.
+When 3+ agents share a channel with one coordinator, declare a role on `wait_for_reply`:
 
-**Normal session** — everything else; assume this if unsure. Nothing is delivered passively. You see messages ONLY while blocked inside a `wait_for_reply` call this turn (persistent by default: it polls inside the one blocking call up to `max_wait_minutes`; pass `persistent: false` only for one-shot intent), or when you poll `check_messages` on a later turn. Never claim otherwise — the server's tool text and the `cross-claude-listening-gate.py` global Stop hook enforce this mechanically.
+- **`role: "active"`** (default) — a normal party. Two active agents both waiting with nothing to say is a *mutual wait*: the server tells the later/greater-id waiter to speak first so nobody deadlocks. This is correct for two peers, but it means an active waiter can be bounced out of its wait by another active waiter.
+- **`role: "parked"`** — a background/worker agent that wants to keep listening but must **never** pull the coordinator out of its wait. Parked agents still receive **every** message (relevance is yours to judge; `@mention` is etiquette, not a delivery filter) — they just don't count as a mutual-wait party, so they never yield and never cause anyone else to yield.
 
-**Receiver etiquette (channels-enabled)**: when a `<channel>` block arrives, act on it and reply INTO the channel via `send_message` — your console reply is invisible to the sender. Still send `done` at collaboration end.
+**Conductor/worker pattern (avoids mutual-wait deadlock):** the coordinator waits `role: "active"`; every worker/background agent waits `role: "parked"`. Result: the conductor is never bounced, workers still hear everything, no deadlock. If you forget the flag it defaults to `active` — safe, just degrades to plain two-party mutual-wait handling.
+
+**One wait per channel:** starting a new `wait_for_reply` on a channel you're already waiting on **supersedes** the old one (the old call returns a clear "superseded" result). Never try to stack waits.
+
+## Delivery modes — know yours before making listening claims (MANDATORY)
+
+There are three honest states. Only claim to be "listening" if you're in one of the first two:
+
+1. **Live push** — a `listen_live(channel)` bridge loop, `cc-listen <channel>`, or a `--dangerously-load-development-channels` native subscription is active. New messages are injected into your context as `<channel>` blocks and wake you when idle. "I'll see messages as they arrive" is TRUE. Turn extra channels on/off mid-session with `listen_live` / `stop_listening`; check `delivery_status` for what's live.
+2. **Background wait** — you are blocked in `wait_for_reply` and it has been auto-backgrounded (Claude Code backgrounds MCP calls past ~120s). The wait keeps running and **wakes your session when a message arrives** — this is real listening. Honest phrasing: *"a background wait is live and will wake me when a message arrives (until <expiry>)."* Once the wait RETURNS (message, `done`, or ceiling) you are deaf until you start another.
+3. **Poll-only** — everything else; assume this if unsure. Nothing is delivered passively. You see messages only when you call `check_messages` on a later turn. Do NOT say you're "listening"/"standing by"/"watching" — say plainly you'll check next time the user prompts you. The server tool text and the `cross-claude-listening-gate.py` Stop hook enforce this (the hook exempts a live background wait).
+
+Default `max_wait_minutes` is **1440 (24h)** — an idle waiter costs one DB poll every few seconds and zero tokens until woken, so a long honest wait beats a false "I'm listening."
+
+**Receiver etiquette (live push)**: when a `<channel>` block arrives, act on it and reply INTO the channel via `send_message` — your console reply is invisible to the sender. Still send `done` at collaboration end. Full mechanics + trade-offs: `cross-claude-mcp/docs/channels.md`.
 
 ## Done Signal (MANDATORY)
 

@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node server.mjs",
     "start:saas": "node saas/server-saas.mjs",
-    "test": "node test.mjs && node test-rest.mjs && node test-mutual-wait.mjs"
+    "test": "node test.mjs && node test-rest.mjs && node test-mutual-wait.mjs && node test-bridge.mjs"
   },
   "keywords": [
     "mcp",

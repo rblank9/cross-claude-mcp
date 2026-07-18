@@ -26,6 +26,25 @@ Claude Code (MCP)                ChatGPT (REST API)
          |--- check_messages() --> sees it  |
 ```
 
+## The Listening Model (roles, waits, and honest delivery)
+
+Multi-agent coordination lives or dies on one question: *is an agent actually listening, or does it just think it is?* Cross-Claude makes the three real states explicit.
+
+**Three delivery modes** — an agent should only claim to be "listening" in the first two:
+
+1. **Live push** — a bridge/channel delivers new messages into the session as they arrive and wakes it when idle. Real live listening. (See "Live delivery" below.)
+2. **Background wait** — the agent is blocked in `wait_for_reply`, which the host may auto-background after a couple of minutes. A backgrounded wait keeps running and **wakes the session when a message arrives** — this is genuine listening until the call returns (message, `done`, or the ceiling). Honest phrasing: *"a background wait is live and will wake me when a message arrives."*
+3. **Poll-only** — everything else. Nothing arrives passively; the agent sees messages only when it next calls `check_messages`. Not listening — it should say so plainly.
+
+**Roles (for 3+ agents with a coordinator).** `wait_for_reply` takes a `role`:
+
+- **`active`** (default) — a normal party. Two active agents both waiting with nothing to say is a *mutual wait*; the server nudges one to speak first so they don't deadlock.
+- **`parked`** — a background/worker agent that keeps listening but must never pull the coordinator out of its wait. Parked agents still receive **every** message; they just don't count as a mutual-wait party. The **conductor/worker pattern**: the coordinator waits `active`, all workers wait `parked` — no deadlock, everyone still hears everything.
+
+**One wait per channel.** Starting a new `wait_for_reply` on a channel you're already waiting on supersedes the old one — waits never stack.
+
+**Ceiling.** `max_wait_minutes` defaults to **1440 (24h)**. An idle waiter is one DB poll every few seconds and zero tokens until woken, so a long honest wait beats a false "I'm listening."
+
 ## Two Modes
 
 ### Local Mode (stdio + SQLite)
@@ -251,11 +270,21 @@ The sender calls `share_data` to store the payload, then sends a lightweight mes
 
 ## Waiting for Replies
 
-After sending a message, use `wait_for_reply` to automatically poll until the other instance responds:
+After sending a message, use `wait_for_reply` to block until the other instance responds:
 
 > "Send bob a request to review auth.py, then wait for his reply."
 
-Claude will call `send_message`, then `wait_for_reply` which blocks (polling every 5 seconds) until bob responds or 90 seconds elapse. If bob sends a `done` message, polling stops immediately.
+The assistant calls `send_message`, then `wait_for_reply`, which stays blocked (polling every few seconds) until bob responds, sends `done`, or `max_wait_minutes` (default 24h) elapses. If the host auto-backgrounds the call, the wait keeps running and wakes the session when a message arrives — see "The Listening Model" above for what counts as genuinely listening, roles (`active`/`parked`), and the one-wait rule.
+
+## Live delivery (optional)
+
+For push instead of a blocking wait, the repo ships `bridge/cross-claude-bridge.mjs` — a small local MCP server that injects new messages into a session as they arrive. It starts idle and is driven live:
+
+- `listen_live(channel)` — start live push for a channel (call again for more)
+- `stop_listening(channel)` — stop it
+- `delivery_status()` — best-effort report of which channels are live vs poll-only
+
+`bridge/cc-listen <channel> [instance]` is sugar that launches a session already listening to one channel. Live delivery requires a host that supports MCP notification push into the session.
 
 ## Presence Detection
 
@@ -354,9 +383,11 @@ The **cross-claude** MCP server lets multiple Claude instances communicate via a
 - Keep your `instance_id` consistent within a session — don't re-register mid-conversation
 
 #### Connection behavior:
-- `wait_for_reply` is persistent by default — it keeps listening until a message arrives or 30 minutes elapse
+- `wait_for_reply` is persistent by default — it keeps listening until a message arrives, a `done` is received, or `max_wait_minutes` (default 24h) elapses
+- Being auto-backgrounded past ~2 minutes is EXPECTED and IS the listen: a backgrounded wait keeps running and wakes the session when a message arrives. Once it returns, nothing is listening until you start another wait
+- ONE wait per channel — a new wait on a channel you're already waiting on supersedes the old one
+- ROLES: a coordinator waits with `role: "active"` (default); a background/worker agent that must never pull the coordinator out of its wait uses `role: "parked"` (still receives every message, never counts as a mutual-wait party)
 - Do NOT treat silence as disconnection — the other instance may be working on a complex task
-- If `wait_for_reply` returns after the max wait time, call it again to keep listening unless the user says to disconnect
 - For quick one-shot messages, pass `persistent: false` to `wait_for_reply`
 - Only stop listening when: you receive a `done` message, the user says to disconnect, or you've sent your own `done`
 ````
