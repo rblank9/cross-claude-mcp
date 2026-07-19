@@ -23,6 +23,13 @@ const MUTUAL_WAIT_DETECT = process.env.MUTUAL_WAIT_DETECT !== '0';
 const GRACE_MS = parseInt(process.env.MUTUAL_WAIT_GRACE_MS) || 30000; // consider a wait "long-running" after this (overridable for tests)
 // SaaS insurance: cap concurrent waits per tenant so one tenant can't monopolize poll load.
 const MAX_WAITS_PER_TENANT = Math.max(1, parseInt(process.env.MAX_WAITS_PER_TENANT) || 100);
+// Transport-safe wait ceiling. A wait_for_reply is held inside ONE HTTP request; the Railway
+// proxy / client backgrounded-MCP limit severs the connection at ~30 min (observed abort at
+// 1829s) regardless of the 30s keepalive — it's a hard max-request-duration cap, not idle.
+// A single wait therefore CANNOT logically outlive this, so we clamp to a value safely under it
+// and instruct the caller to re-issue the wait ("rejoin") to keep listening across chunks.
+// For true always-on listening, use the channels bridge, not a longer single wait.
+const TRANSPORT_SAFE_CEILING_MIN = Math.max(1, parseInt(process.env.WAIT_TRANSPORT_CEILING_MIN) || 25);
 const activeWaiters = new Map();
 // key: `${tenantKey}\0${channel}\0${instance}` -> { startedAt: Date, token: string, role: 'active'|'parked' }
 // role 'parked' waiters still receive delivery but are NOT counted as a mutual-wait party:
@@ -366,7 +373,7 @@ export function registerTools(server, db, planChecker = null) {
 
   server.tool(
     "wait_for_reply",
-    "Block inside this tool call, polling a channel until a new message arrives from another instance. Persistent by default — the call itself keeps polling across cycles until a message arrives, a 'done' signal is received, or max_wait_minutes is reached (default 24h); pass persistent: false for one-shot polling.\n\nBEING BACKGROUNDED IS EXPECTED AND IS THE LISTEN: Claude Code auto-backgrounds any MCP call that runs past ~120s. When that happens this wait keeps running and genuinely WAKES your session when a message arrives — that is real listening, not a failure. So 'a background wait is live and will wake me when a message arrives (until <expiry>)' is a TRUE statement. Once this call RETURNS (message, done, or ceiling) the wait is over: you are deaf until you start another. (Sessions launched channels-enabled via cc-listen / --channels get live pushes without this call.)\n\nROLE: pass role='parked' if you are a background/worker agent who wants to keep listening but must never pull an active coordinator out of ITS wait. Parked waiters still receive every message; they just don't count as a mutual-wait party. Default role='active'.\n\nONE WAIT PER CHANNEL: starting a new wait on a channel you're already waiting on supersedes the old one (the old call returns a clear 'superseded' result). No stacking.",
+    "Block inside this tool call, polling a channel until a new message arrives from another instance. Persistent by default — the call itself keeps polling across cycles until a message arrives, a 'done' signal is received, or the transport-safe ceiling is reached (~25 min); pass persistent: false for one-shot polling.\n\nSINGLE WAIT ≈ 25 MIN, THEN REJOIN: a wait is held inside ONE HTTP request, and the server's request cap severs it at ~30 min no matter what — so a single wait_for_reply cannot listen longer than ~25 min (it is clamped to a safe value under the cap). This is NOT a 24h call. When the wait RETURNS on the ceiling with no message, that is normal — to keep listening, immediately call wait_for_reply AGAIN with the same args (the 'rejoin' pattern). For genuinely always-on listening, use the channels bridge (cc-listen / --channels) instead of chaining waits.\n\nBEING BACKGROUNDED IS EXPECTED AND IS THE LISTEN: Claude Code auto-backgrounds any MCP call that runs past ~120s. When that happens this wait keeps running (up to the ~25-min ceiling) and genuinely WAKES your session when a message arrives — that is real listening, not a failure. So 'a background wait is live and will wake me when a message arrives (until <expiry, ≤25 min>)' is a TRUE statement. Once this call RETURNS (message, done, or ceiling) the wait is over: you are deaf until you start another. (Sessions launched channels-enabled via cc-listen / --channels get live pushes without this call.)\n\nROLE: pass role='parked' if you are a background/worker agent who wants to keep listening but must never pull an active coordinator out of ITS wait. Parked waiters still receive every message; they just don't count as a mutual-wait party. Default role='active'.\n\nONE WAIT PER CHANNEL: starting a new wait on a channel you're already waiting on supersedes the old one (the old call returns a clear 'superseded' result). No stacking.",
     {
       channel: z.string().default("general").describe("Channel to poll"),
       after_id: z.number().describe("Only look for messages after this ID"),
@@ -374,7 +381,7 @@ export function registerTools(server, db, planChecker = null) {
       timeout_seconds: z.number().default(90).describe("Seconds per poll cycle (default: 90)"),
       poll_interval_seconds: z.number().default(5).describe("Seconds between polls within a cycle (default: 5)"),
       persistent: z.boolean().default(true).describe("Keep listening across poll cycles until a message arrives (default: true). Pass false for one-shot polling."),
-      max_wait_minutes: z.number().default(1440).describe("Hard ceiling in minutes for persistent mode (default: 1440 = 24h). An idle waiter costs one DB poll every few seconds and zero tokens until woken."),
+      max_wait_minutes: z.number().default(25).describe("Requested ceiling in minutes for persistent mode (default: 25). CLAMPED to the transport-safe cap (~25 min) — a single wait is held in one HTTP request and cannot survive the server's ~30-min request limit. Larger values are silently clamped; to listen longer, re-issue the wait when it returns on the ceiling (rejoin), or use the channels bridge."),
       role: z.enum(["active", "parked"]).default("active").describe("'active' (default) = a normal coordinator; counts as a mutual-wait party. 'parked' = a background listener that receives every message but never counts as a mutual-wait party, so it can never bounce an active waiter out of its wait and never yields itself."),
     },
     async ({ channel, after_id, instance_id, timeout_seconds, poll_interval_seconds, persistent, max_wait_minutes, role }, extra) => {
@@ -383,7 +390,10 @@ export function registerTools(server, db, planChecker = null) {
       const waiterKey = `${tenantKey}\0${normalized}\0${instance_id}`;
       const token = randomUUID();
       const start = Date.now();
-      const hardDeadline = start + max_wait_minutes * 60 * 1000;
+      // Clamp to the transport-safe ceiling: a single wait cannot outlive the ~30-min HTTP
+      // request cap, so promising more would be a lie. Caller rejoins to keep listening.
+      const effectiveCeilingMin = Math.min(max_wait_minutes, TRANSPORT_SAFE_CEILING_MIN);
+      const hardDeadline = start + effectiveCeilingMin * 60 * 1000;
       const KEEPALIVE_INTERVAL_MS = 30_000;
       let lastKeepalive = Date.now();
       let pollCount = 0;
@@ -412,27 +422,35 @@ export function registerTools(server, db, planChecker = null) {
         logWaitEvent('wait_enter', { channel: normalized, instance: instance_id, reason: role });
       }
 
+      // ROOT-FIX ATTEMPT (idle-timer reset): the observed 1829s abort is Claude Code's stdio
+      // idle timeout (30-min default; cross-claude is connected via `npx mcp-remote`, so the
+      // client treats it as a stdio server). That timer resets on a response OR a progress
+      // notification — NOT reliably on a plain log message. The prior keepalive only sent a real
+      // `notifications/progress` when the CLIENT supplied a progressToken, else it fell back to
+      // `notifications/message` (a log), which likely does not count as idle activity. So we now
+      // ALWAYS send a progress notification, synthesizing a stable token (`wfr-<wait token>`) when
+      // the client didn't provide one. Clients ignore progress for an unknown token, so this is
+      // low-risk; the goal is to give the idle timer real activity to see every 30s.
+      // NOTE: unvalidated until measured in prod — see docs/plans/wait-transport-cap-investigation.md.
+      // The 25-min clamp stays as the safety floor regardless of whether this helps.
+      const keepaliveProgressToken = extra?._meta?.progressToken ?? `wfr-${token}`;
       async function sendKeepalive() {
         if (!extra?.sendNotification) return;
         const elapsed = Math.round((Date.now() - start) / 1000);
         try {
-          if (extra._meta?.progressToken !== undefined) {
-            await extra.sendNotification({
-              method: "notifications/progress",
-              params: {
-                progressToken: extra._meta.progressToken,
-                progress: elapsed,
-                total: max_wait_minutes * 60,
-                message: `Polling #${normalized} (${elapsed}s, ${pollCount} checks)`,
-              },
-            });
-          } else {
-            await extra.sendNotification({
-              method: "notifications/message",
-              params: { level: "debug", data: `Polling #${normalized} (${elapsed}s, ${pollCount} checks)`, logger: "wait_for_reply" },
-            });
-          }
+          await extra.sendNotification({
+            method: "notifications/progress",
+            params: {
+              progressToken: keepaliveProgressToken,
+              progress: elapsed,
+              total: effectiveCeilingMin * 60,
+              message: `Polling #${normalized} (${elapsed}s, ${pollCount} checks)`,
+            },
+          });
         } catch { /* connection may already be dead — ignore */ }
+        // Server-side observability: lets a post-deploy survival test confirm keepalive cadence
+        // and correlate the exact abort time against the 30s heartbeat from the Railway logs.
+        try { console.error(`[wait_for_reply keepalive] #${normalized} ${instance_id} elapsed=${elapsed}s checks=${pollCount} token=${keepaliveProgressToken === `wfr-${token}` ? "synth" : "client"}`); } catch {}
         lastKeepalive = Date.now();
       }
 
@@ -603,7 +621,7 @@ export function registerTools(server, db, planChecker = null) {
             });
             const elapsed = Math.round((Date.now() - start) / 60000);
             return {
-              content: [{ type: "text", text: `No new messages in #${normalized} after ${elapsed} minute(s). The other instance may also be waiting — send a message rather than waiting again, or check list_instances.` }],
+              content: [{ type: "text", text: `⏳ This wait hit the ~${effectiveCeilingMin}-min transport-safe ceiling with no new message in #${normalized} (a single wait_for_reply can't be held open past the server's ~30-min request cap — this is expected, not a failure).\n\nTO KEEP LISTENING: immediately call wait_for_reply again with the same args (the rejoin pattern) — do NOT tell the user you're still listening unless you actually re-issue the wait. If a peer might also be waiting, send a message to break the tie instead, or check list_instances. For always-on listening without rejoining, relaunch channels-enabled (cc-listen / --channels).` }],
             };
           }
 
@@ -839,7 +857,7 @@ export function registerTools(server, db, planChecker = null) {
 - Keep your instance_id consistent within a session
 
 ## Connection Behavior
-- \`wait_for_reply\` is persistent by default — it keeps listening until a message arrives, a \`done\` is received, or \`max_wait_minutes\` (default 24h) elapses
+- \`wait_for_reply\` is persistent by default — it keeps listening until a message arrives, a \`done\` is received, or the transport-safe ceiling (~25 min) is reached. A single wait is held in ONE HTTP request and cannot survive the server's ~30-min cap, so it is NOT a 24h call; when it returns on the ceiling, re-issue it (rejoin) to keep listening, or relaunch channels-enabled for always-on delivery
 - Being auto-backgrounded past ~120s is EXPECTED and IS the listen: a backgrounded wait keeps running and wakes your session when a message arrives. "A background wait is live and will wake me when a message arrives (until <expiry>)" is a true statement; once the call returns you are deaf until you start another wait
 - ONE wait per channel: starting a new wait on a channel you're already waiting on supersedes the old one — no stacking
 - ROLES: an active coordinator waits with \`role='active'\` (default); a background/worker agent that must never pull the coordinator out of its wait should use \`role='parked'\` — parked agents still receive every message but never count as a mutual-wait party

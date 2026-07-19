@@ -33,7 +33,7 @@ Multi-agent coordination lives or dies on one question: *is an agent actually li
 **Three delivery modes** — an agent should only claim to be "listening" in the first two:
 
 1. **Live push** — a bridge/channel delivers new messages into the session as they arrive and wakes it when idle. Real live listening. (See "Live delivery" below.)
-2. **Background wait** — the agent is blocked in `wait_for_reply`, which the host may auto-background after a couple of minutes. A backgrounded wait keeps running and **wakes the session when a message arrives** — this is genuine listening until the call returns (message, `done`, or the ceiling). Honest phrasing: *"a background wait is live and will wake me when a message arrives."*
+2. **Background wait** — the agent is blocked in `wait_for_reply`, which the host may auto-background after a couple of minutes. A backgrounded wait keeps running and **wakes the session when a message arrives** — this is genuine listening until the call returns (message, `done`, or the ceiling). A single wait is held in one HTTP request and cannot outlive the server's ~30-min request cap, so it is clamped to a transport-safe **~25 min** — when it returns on the ceiling, the agent must **rejoin** (re-issue the wait) to keep listening, or use Live push for always-on. Honest phrasing: *"a background wait is live and will wake me when a message arrives (≤25 min, then I rejoin)."*
 3. **Poll-only** — everything else. Nothing arrives passively; the agent sees messages only when it next calls `check_messages`. Not listening — it should say so plainly.
 
 **Roles (for 3+ agents with a coordinator).** `wait_for_reply` takes a `role`:
@@ -274,7 +274,7 @@ After sending a message, use `wait_for_reply` to block until the other instance 
 
 > "Send bob a request to review auth.py, then wait for his reply."
 
-The assistant calls `send_message`, then `wait_for_reply`, which stays blocked (polling every few seconds) until bob responds, sends `done`, or `max_wait_minutes` (default 24h) elapses. If the host auto-backgrounds the call, the wait keeps running and wakes the session when a message arrives — see "The Listening Model" above for what counts as genuinely listening, roles (`active`/`parked`), and the one-wait rule.
+The assistant calls `send_message`, then `wait_for_reply`, which stays blocked (polling every few seconds) until bob responds, sends `done`, or the transport-safe ceiling (~25 min) elapses. If the host auto-backgrounds the call, the wait keeps running and wakes the session when a message arrives; when it returns on the ceiling the assistant rejoins (re-issues the wait) to keep listening — see "The Listening Model" above for what counts as genuinely listening, roles (`active`/`parked`), the rejoin rule, and the one-wait rule.
 
 ## Live delivery (optional)
 
@@ -383,7 +383,7 @@ The **cross-claude** MCP server lets multiple Claude instances communicate via a
 - Keep your `instance_id` consistent within a session — don't re-register mid-conversation
 
 #### Connection behavior:
-- `wait_for_reply` is persistent by default — it keeps listening until a message arrives, a `done` is received, or `max_wait_minutes` (default 24h) elapses
+- `wait_for_reply` is persistent by default — it keeps listening until a message arrives, a `done` is received, or the transport-safe ceiling (~25 min) elapses; a single wait can't outlive the server's ~30-min request cap, so re-issue it (rejoin) to keep listening, or use Live push for always-on
 - Being auto-backgrounded past ~2 minutes is EXPECTED and IS the listen: a backgrounded wait keeps running and wakes the session when a message arrives. Once it returns, nothing is listening until you start another wait
 - ONE wait per channel — a new wait on a channel you're already waiting on supersedes the old one
 - ROLES: a coordinator waits with `role: "active"` (default); a background/worker agent that must never pull the coordinator out of its wait uses `role: "parked"` (still receives every message, never counts as a mutual-wait party)

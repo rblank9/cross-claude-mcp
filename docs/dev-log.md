@@ -4,6 +4,55 @@ Running log of notable issues investigated, decisions made, and why. Newest entr
 
 ---
 
+## 2026-07-19 — wait_for_reply clamped to transport-safe ~25 min + rejoin (24h ceiling was a lie)
+
+**Field report (from a live Claude):** an MCP `wait_for_reply` was **aborted at 1829s** (~30.5 min).
+The topology-aware-listening plan (WS1, `docs/plans/topology-aware-listening.md:58-63`) had flagged
+this as "the biggest unexamined risk" and never measured it — it *assumed* the earlier 1800s death
+was the app ceiling (old 30-min default) and "fixed" it by raising `max_wait_minutes` 30 → 1440 (24h).
+
+**Diagnosis:** the word *abort* is the tell. The app ceiling RETURNS gracefully (`tools.mjs`, a clean
+text result), so a claude would report "30 minute(s)", not a severed connection at a precise 1829s.
+An abort means the HTTP request was **severed underneath the tool** — a transport-layer max-request-
+duration cap (~30 min) on the path (Railway proxy and/or the client's backgrounded-MCP limit). The
+30s keepalive notifications (`tools.mjs:387,548`) do NOT prevent it, so it is a hard duration cap, not
+an idle timeout. **A wait is held in ONE HTTP request → it cannot logically outlive that cap.** The
+shipped 24h ceiling was therefore a lie: agents believed they were listening for 24h and went deaf at
+~30 min (exactly the honesty bug the v2 feature existed to kill).
+
+**Fix (decision: "cap + tell the truth" + client-driven rejoin):**
+- `TRANSPORT_SAFE_CEILING_MIN` (env `WAIT_TRANSPORT_CEILING_MIN`, default **25**). `max_wait_minutes`
+  default 1440 → 25, and the requested value is **clamped** to the safe ceiling — promising more is a lie.
+- Ceiling-return message rewritten: states it hit the ~25-min transport-safe limit (expected, not a
+  failure) and instructs the caller to **immediately re-issue the wait (rejoin)** to keep listening.
+- Tool text / README / skill (`skill/SKILL.md`, symlinked to R's global `cross-claude` skill) teach the
+  rejoin rule + point true always-on listening at the channels bridge (Live push).
+- Tests updated (ceiling-message assertions) — full suite green (54 + 41 + 14, 0 failed).
+
+**Cap source — RESOLVED (same day, via a verification pass):** it is **Claude Code's stdio
+idle-timeout (30-min default)**, not an infra proxy and not an absolute cap. Confirmed decisively:
+`~/.claude.json` connects cross-claude via `npx -y mcp-remote …/mcp`, so the client treats it as a
+**stdio** server and applies the 30-min stdio `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` default (HTTP would
+be 5 min; wall-clock `MCP_TOOL_TIMEOUT` is ~28h). 1829s ≈ that window. Official-doc sourced
+(code.claude.com/docs/en/mcp.md). Full write-up + the corrected mechanism:
+`docs/plans/wait-transport-cap-investigation.md` (AUTHORITATIVE CORRECTION block). An earlier Opus
+pass had mis-called this an immovable absolute cap sourced to unverified GitHub issues — corrected.
+
+**Root-fix ATTEMPT (unvalidated — do not remove the clamp yet):** the idle timer resets on a
+response or a *progress* notification, but our old keepalive only sent real `notifications/progress`
+when the client supplied a progressToken, else it sent a `notifications/message` log (which likely
+does not count). `sendKeepalive` now ALWAYS sends `notifications/progress` (synthesizing a stable
+`wfr-<token>` when absent) + a server-side `console.error` heartbeat for observability. **Must be
+measured in prod** (a >30-min wait that survives) before trusting it; if progress already reached the
+client and still didn't reset the timer (visible progress text in a prior session would indicate
+this), a server fix cannot help and clamp+rejoin is the permanent answer.
+
+**NOT deployed:** R has live cross-claude sessions; redeploy is deferred. Shared `tools.mjs` change →
+needs commit (staged paths only) + SaaS `npm update` + redeploy of both, then the survival
+measurement from a FRESH session (this one is connected to the MCP it changed). Steps in RESUME.md.
+
+---
+
 ## 2026-07-18 — Topology-aware listening v2 (parked role, one-wait, 24h, honest listening, channel-less bridge)
 
 Implemented `docs/plans/topology-aware-listening.md`. Driver: a 3-agent Bagby launch failed

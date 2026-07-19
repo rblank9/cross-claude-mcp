@@ -213,7 +213,7 @@ await test('CHANGE C: Timeout messages mention mutual-wait possibility', async (
   });
 
   const text = result.content[0].text;
-  const hasMutualWaitCopy = text.includes('The other instance may also be waiting');
+  const hasMutualWaitCopy = text.includes('peer might also be waiting');
   assert(hasMutualWaitCopy, 'Hard-deadline timeout message mentions mutual-wait possibility');
 });
 
