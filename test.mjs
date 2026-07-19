@@ -135,7 +135,7 @@ async function runTests() {
     assert(promptText.includes("Channel Discipline"), "Prompt includes channel discipline");
     assert(promptText.includes("Message Protocol"), "Prompt includes message protocol");
     assert(promptText.includes("Connection Behavior"), "Prompt includes connection behavior");
-    assert(promptText.includes("persistent by default"), "Prompt mentions persistent default");
+    assert(promptText.includes("does NOT wake an idle session"), "Prompt states backgrounded wait does not wake an idle session (honest listening model)");
 
     // 3. Register instance
     console.log("\n3. Register instance");

@@ -4,6 +4,39 @@ Running log of notable issues investigated, decisions made, and why. Newest entr
 
 ---
 
+## 2026-07-19 — Honest listening walk-back: a backgrounded wait_for_reply does NOT wake an idle session (Fix #3)
+
+**Field report + live confirmation.** A composer session reported entering a long `wait_for_reply`
+and NEVER being woken for messages that arrived while it was backgrounded — only seeing them ~20 min
+later on a manual prompt. We reproduced it end-to-end (real interactive `claude` v2.1.214, Haiku,
+plain non-channels session via `mcp-remote`, driven from the main session): waiter entered a
+persistent wait, auto-backgrounded at 120s, went idle; a trigger message sent while idle produced
+**no wake, no return** for 80s+ (MCP task still running); a manual prompt then had to "Stop Task" (the
+wait never returned) and `check_messages` instantly showed the message. See
+`docs/plans/wait-transport-cap-investigation.md` → "EMPIRICAL CONFIRMATION".
+
+**Root cause: Claude Code harness limitation, not a server bug.** Delivery works; the harness does not
+re-invoke an idle session on a backgrounded MCP call's completion (unlike Agent/Task completions; cf.
+claude-code issue #21048). So a backgrounded `wait_for_reply` is Poll-only, not listening — and the
+"background wait = real listening" claim shipped in v2.0.0 (skill, tool text, README, WS2 Stop-hook
+exemption) was false for the common case. Server-side wake (fix #1) and mid-session channel switch
+(fix #2) are both infeasible from the server.
+
+**Fix #3 applied (honesty walk-back + external re-invoker):**
+- `tools.mjs` — `wait_for_reply`/`subscribe` tool text + Connection-Behavior prompt rewritten: a wait
+  is a ~2-min FOREGROUND block; a backgrounded wait does NOT wake an idle session; to keep listening
+  without a channels-enabled launch, use an external re-invoker (`ScheduleWakeup`/cron → `check_messages`).
+  Ceiling-return message no longer tells the agent to "rejoin to keep listening."
+- `skill/SKILL.md` (symlinked global) + `README.md` — Delivery-modes rewritten: only Live push is real
+  passive listening; the rejoin rule replaced by the external-re-invoker pattern.
+- Tests updated (prompt assertion → honest claim). Full suite green (54+41+14, 0 failed).
+- **STILL OPEN (flagged to R, not changed here):** the global Stop hook
+  `~/.claude/hooks/cross-claude-listening-gate.py` still EXEMPTS a live backgrounded wait as "listening"
+  — that exemption is now known-false and should be removed, but it affects all live sessions so it's
+  R's call (separate from this repo's deploy).
+
+---
+
 ## 2026-07-19 — wait_for_reply clamped to transport-safe ~25 min + rejoin (24h ceiling was a lie)
 
 **Field report (from a live Claude):** an MCP `wait_for_reply` was **aborted at 1829s** (~30.5 min).

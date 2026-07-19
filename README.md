@@ -30,11 +30,11 @@ Claude Code (MCP)                ChatGPT (REST API)
 
 Multi-agent coordination lives or dies on one question: *is an agent actually listening, or does it just think it is?* Cross-Claude makes the three real states explicit.
 
-**Three delivery modes** — an agent should only claim to be "listening" in the first two:
+**Delivery modes** — only **Live push** is real passive listening:
 
-1. **Live push** — a bridge/channel delivers new messages into the session as they arrive and wakes it when idle. Real live listening. (See "Live delivery" below.)
-2. **Background wait** — the agent is blocked in `wait_for_reply`, which the host may auto-background after a couple of minutes. A backgrounded wait keeps running and **wakes the session when a message arrives** — this is genuine listening until the call returns (message, `done`, or the ceiling). A single wait is held in one HTTP request and cannot outlive the server's ~30-min request cap, so it is clamped to a transport-safe **~25 min** — when it returns on the ceiling, the agent must **rejoin** (re-issue the wait) to keep listening, or use Live push for always-on. Honest phrasing: *"a background wait is live and will wake me when a message arrives (≤25 min, then I rejoin)."*
-3. **Poll-only** — everything else. Nothing arrives passively; the agent sees messages only when it next calls `check_messages`. Not listening — it should say so plainly.
+1. **Live push (the only real passive listen)** — a bridge/channel delivers new messages into the session as they arrive and wakes it when idle. Requires a channels-enabled launch (`cc-listen` / `--channels`). (See "Live delivery" below.)
+2. **Foreground blocking wait (~2 min, not durable listening)** — the agent is blocked in `wait_for_reply`, but the host auto-backgrounds it after ~120s. **A backgrounded `wait_for_reply` does NOT wake an idle session** when a message arrives — verified 2026-07-18 on Claude Code v2.1.214: the call stalls and only unblocks when a human next prompts the session. So a background wait is *not* listening; claiming otherwise is false. (This is a Claude Code harness limitation — delivery works, but the harness doesn't re-invoke an idle session on a backgrounded MCP call's completion, unlike Agent/Task completions.)
+3. **Poll-only** — everything else, including any backgrounded `wait_for_reply`. The agent sees messages only when it's re-invoked and calls `check_messages`. Not listening — it should say so plainly. **To keep listening without a channels-enabled session, use an external re-invoker** (`ScheduleWakeup` / cron) that re-invokes the session on an interval to `check_messages`.
 
 **Roles (for 3+ agents with a coordinator).** `wait_for_reply` takes a `role`:
 
@@ -274,7 +274,7 @@ After sending a message, use `wait_for_reply` to block until the other instance 
 
 > "Send bob a request to review auth.py, then wait for his reply."
 
-The assistant calls `send_message`, then `wait_for_reply`, which stays blocked (polling every few seconds) until bob responds, sends `done`, or the transport-safe ceiling (~25 min) elapses. If the host auto-backgrounds the call, the wait keeps running and wakes the session when a message arrives; when it returns on the ceiling the assistant rejoins (re-issues the wait) to keep listening — see "The Listening Model" above for what counts as genuinely listening, roles (`active`/`parked`), the rejoin rule, and the one-wait rule.
+The assistant calls `send_message`, then `wait_for_reply`, which blocks synchronously (polling every few seconds) until bob responds, sends `done`, or Claude Code auto-backgrounds the call at ~120s. Note the backgrounded call does **not** wake an idle session (see "The Listening Model" above) — for durable listening the assistant uses an external re-invoker or a channels-enabled launch, not a long wait. See "The Listening Model" for roles (`active`/`parked`) and the one-wait rule.
 
 ## Live delivery (optional)
 
@@ -383,8 +383,8 @@ The **cross-claude** MCP server lets multiple Claude instances communicate via a
 - Keep your `instance_id` consistent within a session — don't re-register mid-conversation
 
 #### Connection behavior:
-- `wait_for_reply` is persistent by default — it keeps listening until a message arrives, a `done` is received, or the transport-safe ceiling (~25 min) elapses; a single wait can't outlive the server's ~30-min request cap, so re-issue it (rejoin) to keep listening, or use Live push for always-on
-- Being auto-backgrounded past ~2 minutes is EXPECTED and IS the listen: a backgrounded wait keeps running and wakes the session when a message arrives. Once it returns, nothing is listening until you start another wait
+- `wait_for_reply` is a ~2-minute foreground block, not durable listening — it blocks synchronously until a message arrives, a `done` is received, or Claude Code auto-backgrounds it at ~120s
+- A backgrounded `wait_for_reply` does NOT wake an idle session (verified CC v2.1.214) — it stalls until a human next prompts the session. Don't claim a background wait is "listening." To keep listening without a channels-enabled session, use an external re-invoker (`ScheduleWakeup` / cron) that calls `check_messages` on an interval; only a channels-enabled launch gives real passive push
 - ONE wait per channel — a new wait on a channel you're already waiting on supersedes the old one
 - ROLES: a coordinator waits with `role: "active"` (default); a background/worker agent that must never pull the coordinator out of its wait uses `role: "parked"` (still receives every message, never counts as a mutual-wait party)
 - Do NOT treat silence as disconnection — the other instance may be working on a complex task

@@ -14,6 +14,32 @@ The ~30-min (1829s) abort of `wait_for_reply` originates from **Claude Code's ma
 
 ---
 
+## EMPIRICAL CONFIRMATION — idle-wake FAILS (2026-07-18, live test)
+
+A separate, more serious failure than the transport cap: **a backgrounded `wait_for_reply` does
+not wake an idle session on message arrival.** Tested end-to-end, driven start-to-finish from the
+main session (real interactive `claude` v2.1.214, Haiku, plain non-channels session via `mcp-remote`
+— faithful reproduction):
+
+| Time (UTC) | Event |
+|---|---|
+| 00:48:07 | Waiter registered, entered `wait_for_reply` (persistent, active, 10 min) |
+| ~00:50:10 | Auto-backgrounded at 120s → session idle, "1 MCP task still running", declared "Listening" |
+| 00:51:18 | Trigger message #4894 sent into the channel while the session was idle |
+| 00:52:38 (+80s) | No wake, no response, MCP task still running |
+| 00:53:35 | Manual prompt → had to "Stop Task" (wait never returned) → `check_messages` instantly showed #4894 |
+
+**Conclusions:** (1) delivery works — `check_messages` retrieved the message instantly; (2) the
+backgrounded wait never returned/woke the idle session — it stalled 2+ min after the message and
+only unblocked on a human prompt; (3) **"background wait = real listening" is FALSE** on the current
+build for non-channels sessions. This is a Claude Code harness limitation (idle sessions are not
+re-invoked on a backgrounded MCP call's completion, unlike Agent/Task completions — cf. issue
+#21048), NOT a cross-claude server bug. **Server-side fix #1 is not viable.** Adopted fix: **#3 —
+honest walk-back + external re-invoker** (`ScheduleWakeup`/cron → `check_messages`). Applied across
+tool text, skill, README (2026-07-18).
+
+---
+
 ## AUTHORITATIVE CORRECTION (2026-07-19, added on review)
 
 The executive summary above was directionally right (client-side, ~30 min, keepalive did not
