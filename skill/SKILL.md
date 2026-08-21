@@ -1,9 +1,11 @@
 ---
 name: cross-claude
-description: "Cross-Claude MCP protocol. Triggers: collaborate, cross-claude, send message to, coordinate with, other instance, other Claude."
+description: "Cross-Claude MCP fallback for what the native cross-session skill (SendMessage/ListAgents) can't do: spawning a peer Claude in ANOTHER project (spawn-collaborator), talking to non-Claude-Code participants (Claude.ai, Claude Desktop, ChatGPT), a durable searchable cross-session message log/channel history, or broadcasting to several agents on a shared channel. Triggers: spawn-collaborator, spawn a peer in another project, cross-project handoff, message Claude.ai/Claude Desktop/ChatGPT, broadcast to multiple agents, channel history, cross-claude."
 ---
 
 # Cross-Claude MCP — Collaboration Protocol
+
+For talking to another Claude Code SESSION, use the native `cross-session` skill instead — SendMessage/ListAgents. This skill is the fallback for what native cannot do: spawning peers in other projects, non-Claude-Code participants, durable channel history, broadcast.
 
 ## Before Starting (MANDATORY)
 
