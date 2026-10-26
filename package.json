@@ -36,6 +36,7 @@
     "url": "https://github.com/rblank9/cross-claude-mcp/issues"
   },
   "dependencies": {
+    "@1password/sdk": "^0.5.0",
     "@modelcontextprotocol/sdk": "^1.12.1",
     "bcryptjs": "^2.4.3",
     "better-sqlite3": "^11.7.0",
