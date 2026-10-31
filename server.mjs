@@ -20,6 +20,38 @@ import { createDB } from "./db.mjs";
 import { registerTools } from "./tools.mjs";
 import { createRestRouter } from "./rest-api.mjs";
 import { InviteCodeOAuthProvider, createAuthorizeSubmitHandler } from "./auth.mjs";
+import { requestContext } from "./request-context.mjs";
+import { createHash, timingSafeEqual } from "crypto";
+
+// Parses CROSS_CLAUDE_KEYS (raw JSON object, or base64 of one) into [id, sha256 digest] pairs.
+// Malformed input logs an error and yields no keys; it never throws.
+function loadKeyEntries(raw) {
+  if (!raw) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    try {
+      parsed = JSON.parse(Buffer.from(raw, "base64").toString("utf-8"));
+    } catch {
+      console.error("[AUTH] CROSS_CLAUDE_KEYS is neither JSON nor base64 JSON; treated as empty");
+      return [];
+    }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    console.error("[AUTH] CROSS_CLAUDE_KEYS must be a JSON object; treated as empty");
+    return [];
+  }
+  const entries = [];
+  for (const [id, hex] of Object.entries(parsed)) {
+    if (typeof hex === "string" && /^[0-9a-f]{64}$/i.test(hex)) {
+      entries.push([id, Buffer.from(hex, "hex")]);
+    } else {
+      console.error(`[AUTH] CROSS_CLAUDE_KEYS entry "${id}" is not a sha256 hex digest; skipped`);
+    }
+  }
+  return entries;
+}
 
 // --- Transport: Stdio (local) ---
 
@@ -107,6 +139,7 @@ async function startHTTP(db) {
       sessions: sessions.size,
       sseTransports: sseTransports.size,
       pool: poolStats,
+      killed,
     });
   });
 
@@ -153,6 +186,13 @@ li{margin:4px 0}</style></head>
   // --- Auth: static API key (CLI/REST) OR OAuth bearer token (Claude Desktop) ---
 
   const API_TOKEN = process.env.MCP_API_KEY;
+  const idDigests = loadKeyEntries(process.env.CROSS_CLAUDE_KEYS || "");
+  const legacyDigest = API_TOKEN ? createHash("sha256").update(API_TOKEN).digest() : null;
+  const devOpen = !API_TOKEN && !process.env.CROSS_CLAUDE_KEYS && process.env.CROSS_CLAUDE_DEV === "1";
+  const killed = process.env.CROSS_CLAUDE_KILL === "1";
+  if (!API_TOKEN && !process.env.CROSS_CLAUDE_KEYS && !devOpen) {
+    console.error("no keys configured and CROSS_CLAUDE_DEV unset: all API requests will be refused");
+  }
 
   const oauthBearerAuth = requireBearerAuth({
     verifier: oauthProvider,
@@ -165,33 +205,46 @@ li{margin:4px 0}</style></head>
     // Skip auth for OAuth endpoints (handled by mcpAuthRouter)
     if (req.path.startsWith("/.well-known/") || req.path === "/authorize" || req.path === "/authorize/submit" || req.path === "/token" || req.path === "/register" || req.path === "/revoke") return next();
 
-    const authHeader = req.headers.authorization || "";
+    const hdr = req.headers.authorization || "";
+    const presented = hdr.startsWith("Bearer ")
+      ? hdr.slice(7)
+      : (typeof req.query.api_key === "string" ? req.query.api_key : null);
 
-    // Try static API key first
-    if (API_TOKEN) {
-      const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : req.query.api_key || null;
-      if (token && token === API_TOKEN) {
-        console.log(`[AUTH OK] ${req.method} ${req.path} (api-key)`);
-        return next();
+    // Admit with an identity: req.keyId + AsyncLocalStorage so db.sendMessage stamps sender_key_id.
+    const admit = (kid, how) => {
+      req.keyId = kid;
+      console.log(`[AUTH OK] ${req.method} ${req.path} (${how})`);
+      return requestContext.run({ keyId: kid }, () => next());
+    };
+
+    // Per-identity keys first (constant-time compare of sha256 digests), then the legacy shared key.
+    if (presented) {
+      const d = createHash("sha256").update(presented).digest();
+      let hit = null;
+      for (const [id, ref] of idDigests) {
+        if (timingSafeEqual(d, ref)) hit = id;
       }
+      if (hit !== null) return admit(hit, `key:${hit}`);
+      if (legacyDigest && timingSafeEqual(d, legacyDigest)) return admit("legacy", "key:legacy");
     }
 
-    // Try OAuth bearer token
-    if (authHeader.startsWith("Bearer ")) {
+    // OAuth bearer (Claude Desktop)
+    if (hdr.startsWith("Bearer ")) {
       return oauthBearerAuth(req, res, (err) => {
         if (err) return next(err);
-        console.log(`[AUTH OK] ${req.method} ${req.path} (oauth)`);
-        next();
+        admit("oauth", "key:oauth");
       });
     }
 
-    // No valid auth
-    if (API_TOKEN) {
-      console.log(`[AUTH FAIL] ${req.method} ${req.path}`);
-      return res.status(401).json({ error: "Unauthorized" });
-    }
+    // Fail CLOSED: unauthenticated access only with an explicit CROSS_CLAUDE_DEV=1 and no keys configured.
+    if (devOpen) return admit(null, "dev");
+    console.log(`[AUTH FAIL] ${req.method} ${req.path}`);
+    return res.status(401).json({ error: "Unauthorized" });
+  });
 
-    // No API_TOKEN configured — allow all (dev mode)
+  // Fleet-wide kill switch (Gate 5): CROSS_CLAUDE_KILL=1 stops every message route, incl. legacy transports.
+  app.use(["/api", "/mcp", "/sse", "/messages"], (req, res, next) => {
+    if (killed) return res.status(503).json({ error: "killed" });
     next();
   });
 

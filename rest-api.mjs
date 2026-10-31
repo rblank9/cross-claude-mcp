@@ -187,7 +187,7 @@ export function createRestRouter(db) {
       const formatMessage = (m) => {
         const payload = {
           id: Number(m.id), channel: m.channel, sender: m.sender, content: m.content,
-          message_type: m.message_type, in_reply_to: m.in_reply_to ?? null, created_at: m.created_at,
+          message_type: m.message_type, in_reply_to: m.in_reply_to ?? null, sender_key_id: m.sender_key_id ?? null, created_at: m.created_at,
         };
         return `id: ${payload.id}\nevent: message\ndata: ${JSON.stringify(payload)}\n\n`;
       };

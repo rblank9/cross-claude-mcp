@@ -4,6 +4,7 @@
  */
 
 import { messageEvents } from "./message-events.mjs";
+import { requestContext } from "./request-context.mjs";
 
 const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS channels (
@@ -67,6 +68,9 @@ const INDEX_SQL = `
 const MIGRATION_SESSION_TOKEN_PG = `ALTER TABLE instances ADD COLUMN IF NOT EXISTS session_token TEXT`;
 const MIGRATION_SESSION_TOKEN_SQLITE = `ALTER TABLE instances ADD COLUMN session_token TEXT`;
 
+// Migration: per-identity sender stamp (nullable; NULL for legacy and unauthenticated writes)
+const MIGRATION_SENDER_KEY_PG = `ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender_key_id TEXT`;
+
 /**
  * Normalize channel names: lowercase, replace spaces/underscores with hyphens,
  * strip non-alphanumeric (except hyphens), collapse multiple hyphens.
@@ -100,6 +104,11 @@ class SqliteDB {
     this.db.exec(INDEX_SQL);
     // Migration: add session_token if missing (existing databases)
     try { this.db.exec(MIGRATION_SESSION_TOKEN_SQLITE); } catch { /* column already exists */ }
+    // Migration: add sender_key_id if missing (existing databases); errors propagate
+    const messageCols = this.db.prepare(`PRAGMA table_info(messages)`).all().map((c) => c.name);
+    if (!messageCols.includes("sender_key_id")) {
+      this.db.exec(`ALTER TABLE messages ADD COLUMN sender_key_id TEXT`);
+    }
     this.db.prepare(`INSERT OR IGNORE INTO channels (name, description) VALUES ('general', 'Default channel for cross-instance communication')`).run();
   }
 
@@ -183,12 +192,13 @@ class SqliteDB {
   }
 
   sendMessage(channel, sender, content, messageType, inReplyTo) {
+    const senderKeyId = requestContext.getStore()?.keyId ?? null;
     const result = this.db.prepare(
-      `INSERT INTO messages (channel, sender, content, message_type, in_reply_to) VALUES (?, ?, ?, ?, ?)`
-    ).run(channel, sender, content, messageType, inReplyTo);
+      `INSERT INTO messages (channel, sender, content, message_type, in_reply_to, sender_key_id) VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(channel, sender, content, messageType, inReplyTo, senderKeyId);
     const id = result.lastInsertRowid;
     try {
-      messageEvents.emit("message", { id: Number(id), channel, sender, content, message_type: messageType, in_reply_to: inReplyTo ?? null, created_at: new Date().toISOString() });
+      messageEvents.emit("message", { id: Number(id), channel, sender, content, message_type: messageType, in_reply_to: inReplyTo ?? null, sender_key_id: senderKeyId, created_at: new Date().toISOString() });
     } catch (e) {
       console.error("messageEvents listener error:", e);
     }
@@ -332,6 +342,8 @@ class PostgresDB {
     await this.pool.query(SEED_SQL);
     // Migration: add session_token if missing (existing databases)
     await this.pool.query(MIGRATION_SESSION_TOKEN_PG).catch(() => {});
+    // Migration: per-identity sender stamp; errors propagate (no silent swallow)
+    await this.pool.query(MIGRATION_SENDER_KEY_PG);
   }
 
   async getInstance(instanceId) {
@@ -424,13 +436,14 @@ class PostgresDB {
   }
 
   async sendMessage(channel, sender, content, messageType, inReplyTo) {
+    const senderKeyId = requestContext.getStore()?.keyId ?? null;
     const result = await this.pool.query(
-      `INSERT INTO messages (channel, sender, content, message_type, in_reply_to) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-      [channel, sender, content, messageType, inReplyTo]
+      `INSERT INTO messages (channel, sender, content, message_type, in_reply_to, sender_key_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+      [channel, sender, content, messageType, inReplyTo, senderKeyId]
     );
     const id = result.rows[0].id;
     try {
-      messageEvents.emit("message", { id: Number(id), channel, sender, content, message_type: messageType, in_reply_to: inReplyTo ?? null, created_at: new Date().toISOString() });
+      messageEvents.emit("message", { id: Number(id), channel, sender, content, message_type: messageType, in_reply_to: inReplyTo ?? null, sender_key_id: senderKeyId, created_at: new Date().toISOString() });
     } catch (e) {
       console.error("messageEvents listener error:", e);
     }

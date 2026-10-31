@@ -57,7 +57,7 @@ async function runTests() {
 
   const server = spawn("node", [SERVER_PATH], {
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, PORT: String(PORT), HOME: TEST_DB_DIR },
+    env: { ...process.env, PORT: String(PORT), HOME: TEST_DB_DIR, CROSS_CLAUDE_DEV: "1" },
   });
 
   // Wait for server to start
