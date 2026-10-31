@@ -3,6 +3,8 @@
  * Uses SQLite locally, PostgreSQL on Railway (when DATABASE_URL is set).
  */
 
+import { messageEvents } from "./message-events.mjs";
+
 const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS channels (
     name TEXT PRIMARY KEY,
@@ -184,7 +186,13 @@ class SqliteDB {
     const result = this.db.prepare(
       `INSERT INTO messages (channel, sender, content, message_type, in_reply_to) VALUES (?, ?, ?, ?, ?)`
     ).run(channel, sender, content, messageType, inReplyTo);
-    return result.lastInsertRowid;
+    const id = result.lastInsertRowid;
+    try {
+      messageEvents.emit("message", { id: Number(id), channel, sender, content, message_type: messageType, in_reply_to: inReplyTo ?? null, created_at: new Date().toISOString() });
+    } catch (e) {
+      console.error("messageEvents listener error:", e);
+    }
+    return id;
   }
 
   getMessages(channel, limit) {
@@ -420,7 +428,13 @@ class PostgresDB {
       `INSERT INTO messages (channel, sender, content, message_type, in_reply_to) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
       [channel, sender, content, messageType, inReplyTo]
     );
-    return result.rows[0].id;
+    const id = result.rows[0].id;
+    try {
+      messageEvents.emit("message", { id: Number(id), channel, sender, content, message_type: messageType, in_reply_to: inReplyTo ?? null, created_at: new Date().toISOString() });
+    } catch (e) {
+      console.error("messageEvents listener error:", e);
+    }
+    return id;
   }
 
   async getMessages(channel, limit) {

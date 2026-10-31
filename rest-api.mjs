@@ -11,6 +11,7 @@
 import { Router } from "express";
 import { STALE_THRESHOLD_SECONDS } from "./tools.mjs";
 import { normalizeChannelName } from "./db.mjs";
+import { messageEvents } from "./message-events.mjs";
 
 /**
  * @param {object} db - Database instance (SqliteDB or PostgresDB)
@@ -163,6 +164,90 @@ export function createRestRouter(db) {
       if (!data) return res.status(404).json({ error: `No shared data for key "${req.params.key}"` });
       res.json(data);
     } catch (e) { next(e); }
+  });
+
+  // --- Live stream (SSE) ---
+
+  router.get("/stream", async (req, res, next) => {
+    let cleanup = () => {};
+    try {
+      const channels = [].concat(req.query.channels ?? []).join(",").split(",")
+        .map((c) => normalizeChannelName(c.trim())).filter(Boolean);
+      if (channels.length === 0) return res.status(400).json({ error: "channels query parameter is required (comma-separated)" });
+      if (channels.length > 20) return res.status(400).json({ error: "at most 20 channels per stream" });
+      let afterId;
+      if (req.query.after_id !== undefined && req.query.after_id !== "") {
+        afterId = parseInt(req.query.after_id, 10);
+        if (Number.isNaN(afterId)) return res.status(400).json({ error: "after_id must be an integer" });
+      }
+      const instanceId = typeof req.query.instance_id === "string" && req.query.instance_id ? req.query.instance_id : null;
+      const wanted = new Set(channels);
+      const heartbeatMs = parseInt(process.env.STREAM_HEARTBEAT_MS, 10) || 15000;
+
+      const formatMessage = (m) => {
+        const payload = {
+          id: Number(m.id), channel: m.channel, sender: m.sender, content: m.content,
+          message_type: m.message_type, in_reply_to: m.in_reply_to ?? null, created_at: m.created_at,
+        };
+        return `id: ${payload.id}\nevent: message\ndata: ${JSON.stringify(payload)}\n\n`;
+      };
+
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("X-Accel-Buffering", "no");
+      res.flushHeaders();
+
+      let catchingUp = true;
+      const pending = [];
+      let lastSentId = afterId ?? null;
+      let closed = false;
+      // Dedupe by id SET, not by max id: on Postgres two concurrent sends can commit out of
+      // id order, so a lower id can arrive after a higher one and must still be delivered.
+      const seen = new Set();
+      const write = (chunk) => { if (!closed) res.write(chunk); };
+      const deliver = (msg) => {
+        const id = Number(msg.id);
+        if (afterId !== undefined && id <= afterId) return;
+        if (seen.has(id)) return;
+        seen.add(id);
+        if (seen.size > 5000) seen.delete(seen.values().next().value);
+        if (lastSentId === null || id > lastSentId) lastSentId = id;
+        if (instanceId !== null && msg.sender === instanceId) return;
+        write(formatMessage(msg));
+      };
+      const onMessage = (msg) => {
+        if (!wanted.has(msg.channel)) return;
+        if (catchingUp) pending.push(msg);
+        else deliver(msg);
+      };
+      messageEvents.on("message", onMessage);
+      const heartbeat = setInterval(() => write(`: ping ${Date.now()}\n\n`), heartbeatMs);
+      // res "close" (not req): on Node 16+ req emits "close" as soon as the GET body is consumed.
+      cleanup = () => {
+        if (closed) return;
+        closed = true;
+        messageEvents.off("message", onMessage);
+        clearInterval(heartbeat);
+      };
+      res.on("close", cleanup);
+
+      let rows = [];
+      if (afterId !== undefined) {
+        for (const ch of channels) rows = rows.concat(await db.getMessagesSince(ch, afterId));
+      }
+      rows.sort((a, b) => Number(a.id) - Number(b.id));
+      for (const row of rows) deliver(row);
+      catchingUp = false;
+      pending.sort((a, b) => Number(a.id) - Number(b.id));
+      for (const msg of pending.splice(0)) deliver(msg);
+      write(`event: ready\ndata: ${JSON.stringify({ last_id: lastSentId ?? null })}\n\n`);
+    } catch (e) {
+      cleanup();
+      if (!res.headersSent) return next(e);
+      console.error("REST /stream error:", e);
+      res.end();
+    }
   });
 
   // --- Error handler ---
