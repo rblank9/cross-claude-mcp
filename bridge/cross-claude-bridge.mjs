@@ -1,125 +1,432 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import fs from "fs";
+import os from "os";
+import path from "path";
+import { pathToFileURL } from "url";
 
-// Channel-less live-delivery bridge.
-//
-// Loads with NO channel and sits idle until a session asks it to listen. The model turns live
-// delivery on/off mid-session with the listen_live / stop_listening tools; each active channel
-// runs its own poll loop that pushes notifications/claude/channel into the session. This removes
-// the old launch-only constraint where the channel had to be chosen before the session started.
-//
-// Backward-compatible: set BRIDGE_CHANNEL (+ optional BRIDGE_AUTOSTART=1, the default when
-// BRIDGE_CHANNEL is present) to auto-start one channel at launch — that's how cc-listen works.
+// Cross-claude live-delivery bridge (stdio MCP server, v0.3.0).
+// Holds ONE SSE connection to the server and pushes every new message into the session
+// as notifications/claude/channel. Reconnects with backoff and resumes from a cursor.
 
-const CROSS_CLAUDE_URL = process.env.CROSS_CLAUDE_URL || "https://cross-claude-mcp-production.up.railway.app";
-const CROSS_CLAUDE_API_KEY = process.env.CROSS_CLAUDE_API_KEY;
-const BRIDGE_INSTANCE = process.env.BRIDGE_INSTANCE || null;
-const BRIDGE_POLL_MS = Math.max(2000, parseInt(process.env.BRIDGE_POLL_MS) || 5000);
-const BRIDGE_CHANNEL = process.env.BRIDGE_CHANNEL || null;
-const BRIDGE_AUTOSTART = process.env.BRIDGE_AUTOSTART === "1" || (BRIDGE_CHANNEL && process.env.BRIDGE_AUTOSTART !== "0");
+const VERSION = "0.3.0";
+const DEFAULT_URL = "https://cross-claude-mcp-production.up.railway.app";
+const AUTH_HEADER = "Authorization";
+const SCHEME_RE = /^\S+\s+/;
+const BACKFILL_MS = 10 * 60 * 1000;
+const WATCHDOG_MS = 45000;
+const REGISTER_MS = 5 * 60 * 1000;
+const IDENTITY_MS = 60 * 1000;
+const SEEN_CAP = 5000;
 
-if (!CROSS_CLAUDE_API_KEY) {
-  console.error("Error: CROSS_CLAUDE_API_KEY is required");
-  process.exit(1);
-}
+const log = (msg) => process.stderr.write(`cross-claude-bridge: ${msg}\n`);
+const slug = (s) => String(s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+const normChannel = (s) => String(s ?? "").trim().toLowerCase().replace(/[\s_]+/g, "-").replace(/[^a-z0-9-]/g, "");
+const textResult = (text) => ({ content: [{ type: "text", text }] });
 
-console.error(`cross-claude-bridge starting (channel-less):`);
-console.error(`  URL: ${CROSS_CLAUDE_URL}`);
-console.error(`  Instance filter: ${BRIDGE_INSTANCE || "none"}`);
-console.error(`  Poll interval: ${BRIDGE_POLL_MS}ms`);
-console.error(`  Auto-start channel: ${BRIDGE_AUTOSTART ? BRIDGE_CHANNEL : "none (idle until listen_live)"}`);
-
-function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
-
-async function fetchJson(url, options = {}) {
-  const res = await fetch(url, {
-    ...options,
-    headers: { ...options.headers, "Authorization": `Bearer ${CROSS_CLAUDE_API_KEY}` },
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-  return await res.json();
-}
-
-// channel -> { cursor, running, startedAt, pollMs } for each live push loop.
-const loops = new Map();
-let mcp; // set in main()
-
-async function initCursor(channel) {
-  const res = await fetchJson(`${CROSS_CLAUDE_URL}/api/messages/${channel}?limit=1`);
-  return res.last_id ?? 0;
-}
-
-async function runLoop(channel) {
-  const state = loops.get(channel);
-  if (!state) return;
-  while (state.running) {
-    try {
-      await sleep(state.pollMs);
-      if (!state.running) break;
-      const url = new URL(`${CROSS_CLAUDE_URL}/api/messages/${channel}`);
-      url.searchParams.set("after_id", state.cursor);
-      if (BRIDGE_INSTANCE) url.searchParams.set("instance_id", BRIDGE_INSTANCE);
-      const res = await fetchJson(url.href);
-      for (const m of res.messages) {
-        await mcp.server.notification({
-          method: "notifications/claude/channel",
-          params: {
-            content: `[#${channel}] ${m.sender} (${m.message_type}): ${m.content}`,
-            meta: { channel, sender: m.sender, id: String(m.id), message_type: m.message_type },
-          },
-        });
-        console.error(`bridged #${m.id} from ${m.sender} on #${channel}`);
+function credentialFromMcpJson(file) {
+  try {
+    const data = JSON.parse(fs.readFileSync(file, "utf-8"));
+    for (const entry of Object.values(data.mcpServers || {})) {
+      const value = entry?.headers?.[AUTH_HEADER];
+      if (typeof value === "string") {
+        const stripped = value.replace(SCHEME_RE, "");
+        if (stripped) return stripped;
       }
-      if (typeof res.last_id === "number") state.cursor = res.last_id;
-      state.pollMs = BRIDGE_POLL_MS; // reset backoff after a good poll
-    } catch (err) {
-      console.error(`poll error on #${channel}: ${err.message}`);
-      state.pollMs = Math.min(state.pollMs * 2, 60000); // bounded backoff, never a tight loop
+    }
+  } catch {}
+  return null;
+}
+
+function listDir(dir) {
+  try {
+    return fs.readdirSync(dir).sort();
+  } catch {
+    return [];
+  }
+}
+
+export function findApiKey(env, home) {
+  if (env.CROSS_CLAUDE_API_KEY) return env.CROSS_CLAUDE_API_KEY;
+  const fromConfig = credentialFromMcpJson(path.join(home, ".config", "cross-claude", "mcp.json"));
+  if (fromConfig) return fromConfig;
+  for (const d of listDir(home).filter((n) => n.startsWith(".claude"))) {
+    const cacheDir = path.join(home, d, "plugins", "cache", "cross-claude-local", "cross-claude");
+    for (const version of listDir(cacheDir)) {
+      const found = credentialFromMcpJson(path.join(cacheDir, version, ".mcp.json"));
+      if (found) return found;
     }
   }
-  console.error(`stopped listening on #${channel}`);
+  return null;
 }
 
-async function startListening(channel) {
-  if (loops.has(channel) && loops.get(channel).running) {
-    return { already: true };
+function sessionNameFor(home, ppid) {
+  for (const d of listDir(home).filter((n) => n.startsWith(".claude"))) {
+    try {
+      const data = JSON.parse(fs.readFileSync(path.join(home, d, "sessions", `${ppid}.json`), "utf-8"));
+      if (typeof data.name === "string" && data.name.trim()) return data.name.trim();
+    } catch {}
   }
-  const cursor = await initCursor(channel);
-  const state = { cursor, running: true, startedAt: Date.now(), pollMs: BRIDGE_POLL_MS };
-  loops.set(channel, state);
-  runLoop(channel); // fire-and-forget; loop self-terminates when running=false
-  return { already: false, cursor };
-}
-
-function stopListening(channel) {
-  const state = loops.get(channel);
-  if (!state || !state.running) return false;
-  state.running = false;
-  loops.delete(channel);
-  return true;
+  return null;
 }
 
 async function main() {
-  mcp = new McpServer(
-    { name: "cross-claude-bridge", version: "0.2.0" },
+  const home = process.env.HOME || os.homedir();
+  const credential = findApiKey(process.env, home);
+  if (!credential) {
+    process.stderr.write("cross-claude-bridge: no API key found (checked CROSS_CLAUDE_API_KEY, ~/.config/cross-claude/mcp.json, ~/.claude*/plugins/cache/cross-claude-local/cross-claude/*/.mcp.json)\n");
+    process.exit(1);
+  }
+
+  const BASE = (process.env.CROSS_CLAUDE_URL || DEFAULT_URL).replace(/\/+$/, "");
+  const headers = { [AUTH_HEADER]: `Bearer ${credential}` };
+  const HOST = os.hostname();
+  const SHORT_HOST = slug(HOST.split(".")[0]);
+  const FIXED_ID = process.env.BRIDGE_INSTANCE || null;
+  const NO_INBOX = process.env.BRIDGE_NO_INBOX === "1";
+  const BRIDGE_CHANNEL = process.env.BRIDGE_CHANNEL ? normChannel(process.env.BRIDGE_CHANNEL) : "";
+  const AUTOSTART = process.env.BRIDGE_AUTOSTART === "1" || (!!BRIDGE_CHANNEL && process.env.BRIDGE_AUTOSTART !== "0");
+
+  const computeIdentity = () => {
+    if (FIXED_ID) return { key: FIXED_ID, name: null, instanceId: FIXED_ID };
+    const name = sessionNameFor(home, process.ppid);
+    const instanceId = name
+      ? `${slug(name)}-${SHORT_HOST}`
+      : `${slug(path.basename(process.cwd()))}-${process.ppid}-${SHORT_HOST}`;
+    return { key: name || "", name, instanceId };
+  };
+
+  const first = computeIdentity();
+  let identityKey = first.key;
+  let sessionName = first.name;
+  let instanceId = first.instanceId;
+  let inbox = `dm-${instanceId}`;
+
+  const channels = new Set();
+  if (!NO_INBOX) channels.add(inbox);
+  if (AUTOSTART && BRIDGE_CHANNEL) channels.add(BRIDGE_CHANNEL);
+
+  const seen = new Set();
+  let cursor = 0;
+  let cursorReady = false;
+  let mode = "stream";
+  let connected = false;
+  let lastByteAt = 0;
+  let reconnects = 0;
+  let lastError = "";
+  let delivered = 0;
+  let gen = 0;
+  let ctl = null;
+  let abortReason = null;
+  let backoff = 1000;
+  let retryTimer = null;
+  let pollTimer = null;
+  let pollDelay = 2000;
+  let stopping = false;
+  let watchdog = null;
+  let identityTimer = null;
+  let registerTimer = null;
+
+  const mcp = new McpServer(
+    { name: "cross-claude-bridge", version: VERSION },
     { capabilities: { experimental: { "claude/channel": {} } } }
+  );
+
+  const api = async (p, init = {}) => {
+    const h = { ...headers };
+    if (init.body) h["Content-Type"] = "application/json";
+    const res = await fetch(`${BASE}${p}`, { ...init, headers: h });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  };
+
+  const deliver = (m) => {
+    const id = Number(m.id);
+    if (seen.has(id)) return;
+    seen.add(id);
+    if (seen.size > SEEN_CAP) seen.delete(seen.values().next().value);
+    if (id > cursor) cursor = id;
+    let content = `[#${m.channel}] ${m.sender}: ${m.content}`;
+    if (m.channel === inbox) {
+      content += `\n\n(Direct message to you. Reply with the cross-claude-bridge "send" tool, to="${m.sender}".)`;
+    }
+    const meta = {
+      channel: String(m.channel),
+      sender: String(m.sender),
+      id: String(id),
+      message_type: String(m.message_type ?? "message"),
+      in_reply_to: m.in_reply_to == null ? "" : String(m.in_reply_to),
+    };
+    mcp.server
+      .notification({ method: "notifications/claude/channel", params: { content, meta } })
+      .catch((e) => log(`push failed for #${id}: ${e.message}`));
+    delivered++;
+  };
+
+  const backfillInbox = async () => {
+    try {
+      const data = await api(`/api/messages/${encodeURIComponent(inbox)}?limit=20`);
+      const cutoff = Date.now() - BACKFILL_MS;
+      const recent = (data.messages || [])
+        .filter((m) => m.sender !== instanceId && Date.parse(m.created_at) >= cutoff)
+        .sort((a, b) => Number(a.id) - Number(b.id));
+      for (const m of recent) deliver(m);
+    } catch (e) {
+      log(`inbox backfill failed: ${e.message}`);
+    }
+  };
+
+  // One attempt. Returns true when the cursor is set; the caller retries with backoff.
+  const initCursor = async () => {
+    try {
+      let max = 0;
+      for (const ch of channels) {
+        const data = await api(`/api/messages/${encodeURIComponent(ch)}?limit=1`);
+        max = Math.max(max, Number(data.last_id ?? 0));
+      }
+      cursor = max;
+      cursorReady = true;
+      if (!NO_INBOX) await backfillInbox();
+      return true;
+    } catch (e) {
+      log(`initial cursor fetch failed: ${e.message}`);
+      return false;
+    }
+  };
+
+  const handleBlock = (block) => {
+    let event = "message";
+    const dataLines = [];
+    for (const line of block.split("\n")) {
+      if (line.startsWith("event:")) event = line.slice(6).trim();
+      else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+    }
+    if (event === "ready") {
+      backoff = 1000;
+      lastError = "";
+      return;
+    }
+    if (event === "message" && dataLines.length) {
+      try {
+        deliver(JSON.parse(dataLines.join("\n")));
+      } catch (e) {
+        log(`bad message frame: ${e.message}`);
+      }
+    }
+  };
+
+  const scheduleReconnect = (reason) => {
+    connected = false;
+    lastError = reason;
+    reconnects++;
+    const delay = backoff + Math.floor(Math.random() * 500);
+    backoff = Math.min(backoff * 2, 30000);
+    log(`reconnect #${reconnects} in ${delay} ms (${reason})`);
+    if (retryTimer) clearTimeout(retryTimer);
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      connectNow();
+    }, delay);
+  };
+
+  const pollLoop = async () => {
+    if (mode !== "poll" || stopping) return;
+    const batch = [];
+    let failed = false;
+    for (const ch of [...channels]) {
+      try {
+        const qs = new URLSearchParams({ after_id: String(cursor), instance_id: instanceId });
+        const data = await api(`/api/messages/${encodeURIComponent(ch)}?${qs}`);
+        batch.push(...(data.messages || []));
+      } catch (e) {
+        failed = true;
+        lastError = e.message;
+      }
+    }
+    batch.sort((a, b) => Number(a.id) - Number(b.id));
+    for (const m of batch) deliver(m);
+    connected = !failed;
+    pollDelay = failed ? Math.min(pollDelay * 2, 30000) : 2000;
+    pollTimer = setTimeout(pollLoop, pollDelay);
+  };
+
+  const switchToPoll = () => {
+    mode = "poll";
+    connected = false;
+    log("server has no /api/stream; switching to poll mode");
+    pollLoop();
+  };
+
+  const runStream = async (myGen, myCtl) => {
+    let reason = "stream ended";
+    try {
+      if (!cursorReady) {
+        const ok = await initCursor();
+        if (myGen !== gen) return;
+        if (!ok) throw new Error("initial cursor unavailable");
+      }
+      const qs = new URLSearchParams({
+        channels: [...channels].join(","),
+        after_id: String(cursor),
+        instance_id: instanceId,
+      });
+      const res = await fetch(`${BASE}/api/stream?${qs}`, { headers, signal: myCtl.signal });
+      if (myGen !== gen) return;
+      if (res.status === 404) {
+        switchToPoll();
+        return;
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      connected = true;
+      lastByteAt = Date.now();
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (myGen !== gen) return;
+        if (done) break;
+        lastByteAt = Date.now();
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) !== -1) {
+          const block = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          handleBlock(block);
+        }
+      }
+    } catch (e) {
+      if (myGen !== gen) return;
+      reason = abortReason || e.message;
+    }
+    if (myGen !== gen) return;
+    scheduleReconnect(reason);
+  };
+
+  // Start (or restart) the stream with the current channel set. Supersedes any live connection.
+  const connectNow = () => {
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+    if (ctl) ctl.abort();
+    ctl = null;
+    const myGen = ++gen;
+    connected = false;
+    if (mode !== "stream" || stopping || channels.size === 0) return;
+    const myCtl = new AbortController();
+    ctl = myCtl;
+    abortReason = null;
+    runStream(myGen, myCtl).catch((e) => log(`stream loop error: ${e.message}`));
+  };
+
+  const register = async () => {
+    try {
+      await api("/api/register", {
+        method: "POST",
+        body: JSON.stringify({
+          instance_id: instanceId,
+          description: `Claude Code session "${sessionName || instanceId}" on ${HOST} (cwd ${process.cwd()}), bridge v${VERSION}`,
+        }),
+      });
+    } catch (e) {
+      log(`register failed: ${e.message}`);
+    }
+  };
+
+  const applyIdentity = (next) => {
+    if (next.instanceId === instanceId) return;
+    const oldInbox = inbox;
+    instanceId = next.instanceId;
+    sessionName = next.name;
+    inbox = `dm-${instanceId}`;
+    channels.delete(oldInbox);
+    if (!NO_INBOX) channels.add(inbox);
+    log(`identity changed to ${instanceId}`);
+    register();
+    connectNow();
+  };
+
+  const refreshIdentity = () => {
+    if (FIXED_ID) return;
+    const next = computeIdentity();
+    if (next.key === identityKey) return;
+    identityKey = next.key;
+    applyIdentity(next);
+  };
+
+  mcp.tool(
+    "send",
+    "Send a message. to starting with # posts to that channel; otherwise to is an instance_id and the message goes to its inbox.",
+    {
+      to: z.string().describe("Instance id (e.g. 'alice-laptop') or '#channel'"),
+      message: z.string().describe("Message text"),
+      in_reply_to: z.number().optional().describe("Optional message id this replies to"),
+    },
+    async ({ to, message, in_reply_to }) => {
+      try {
+        const channel = to.startsWith("#") ? normChannel(to.slice(1)) : `dm-${to}`;
+        if (!channel || channel === "dm-") return textResult("Send failed: empty destination");
+        const r = await api("/api/messages", {
+          method: "POST",
+          body: JSON.stringify({
+            channel,
+            sender: instanceId,
+            content: message,
+            message_type: "message",
+            ...(in_reply_to != null ? { in_reply_to } : {}),
+          }),
+        });
+        return textResult(`Sent #${r.id} to ${to}`);
+      } catch (e) {
+        return textResult(`Send failed: ${e.message}`);
+      }
+    }
+  );
+
+  mcp.tool("peers", "List cross-claude instances, online first.", {}, async () => {
+    try {
+      const data = await api("/api/instances");
+      const rows = [...(data.instances || [])].sort((a, b) => (b.status === "online") - (a.status === "online"));
+      const lines = rows.map(
+        (i) => `${i.instance_id} — ${i.status} — ${i.last_seen} — ${i.description}${i.instance_id === instanceId ? " (you)" : ""}`
+      );
+      lines.push('Send to any of these with send(to="<instance_id>")');
+      return textResult(lines.join("\n"));
+    } catch (e) {
+      return textResult(`Peers lookup failed: ${e.message}`);
+    }
+  });
+
+  mcp.tool("whoami", "Show this session's bridge identity, inbox, server, and delivery mode.", {}, async () =>
+    textResult(
+      [
+        `instance_id: ${instanceId}`,
+        `inbox: ${inbox}`,
+        `hostname: ${HOST}`,
+        `server: ${BASE}`,
+        `mode: ${mode}`,
+        `connected: ${connected}`,
+      ].join("\n")
+    )
   );
 
   mcp.tool(
     "listen_live",
-    "Turn ON live push delivery for a channel from THIS session onward. Starts a poll loop that injects each new message into your context as it arrives (notifications/claude/channel) — real live listening, no wait_for_reply needed, works even while idle. Call again for other channels to listen to several at once. Use stop_listening to turn a channel off.",
+    "Turn ON live push delivery for a channel from THIS session onward. Opens a live stream that injects each new message into your context as it arrives (notifications/claude/channel) — real live listening, no wait_for_reply needed, works even while idle. Call again for other channels to listen to several at once. Use stop_listening to turn a channel off.",
     { channel: z.string().describe("Channel to start live-listening to (e.g. 'general', 'bagby-launch')") },
     async ({ channel }) => {
-      try {
-        const { already, cursor } = await startListening(channel);
-        const text = already
-          ? `Already live-listening on #${channel}. New messages are pushed into this session as they arrive.`
-          : `🔔 Live push ON for #${channel} (from message id ${cursor}). New messages will be injected into this session as they arrive — you are genuinely listening, even while idle. Call stop_listening to turn it off.`;
-        return { content: [{ type: "text", text }] };
-      } catch (err) {
-        return { content: [{ type: "text", text: `Could not start live listening on #${channel}: ${err.message}. You can still poll with check_messages or block in wait_for_reply.` }] };
+      const ch = normChannel(channel);
+      if (!ch) return textResult(`Could not start live listening: "${channel}" is not a valid channel name.`);
+      if (channels.has(ch)) {
+        return textResult(`Already live-listening on #${ch}. New messages are pushed into this session as they arrive.`);
       }
+      channels.add(ch);
+      connectNow();
+      return textResult(
+        `🔔 Live push ON for #${ch} (from message id ${cursor}). New messages will be injected into this session as they arrive — you are genuinely listening, even while idle. Call stop_listening to turn it off.`
+      );
     }
   );
 
@@ -128,29 +435,42 @@ async function main() {
     "Turn OFF live push delivery for a channel started with listen_live. After this, messages on that channel are no longer pushed to your session; you would need to poll or wait_for_reply to see them.",
     { channel: z.string().describe("Channel to stop live-listening to") },
     async ({ channel }) => {
-      const stopped = stopListening(channel);
-      const text = stopped
-        ? `🔕 Live push OFF for #${channel}. New messages there are no longer delivered to this session unless you poll or wait_for_reply.`
-        : `Not currently live-listening on #${channel} (nothing to stop).`;
-      return { content: [{ type: "text", text }] };
+      const ch = normChannel(channel);
+      if (ch && ch === inbox) {
+        return textResult(`The inbox ${inbox} cannot be removed. Direct messages to you are always delivered.`);
+      }
+      if (!channels.has(ch)) return textResult(`Not currently live-listening on #${ch} (nothing to stop).`);
+      channels.delete(ch);
+      connectNow();
+      return textResult(
+        `🔕 Live push OFF for #${ch}. New messages there are no longer delivered to this session unless you poll or wait_for_reply.`
+      );
     }
   );
 
   mcp.tool(
     "delivery_status",
-    "Report, best-effort, how THIS session is currently receiving cross-claude messages: which channels have live push ON (via listen_live), versus channels you can only see by polling check_messages or blocking in wait_for_reply. Best-effort: it reports what is registered/running in this bridge, not proof that every push reaches the model — a dropped notification or a dead poll loop cannot be seen from here. Background wait_for_reply state is known only to the session that opened the wait, so it is not listed here.",
+    "Report, best-effort, how THIS session is currently receiving cross-claude messages: mode, connection, reconnects, last error, cursor, delivered count, and the channels listened to.",
     {},
     async () => {
-      const live = [...loops.entries()].filter(([, s]) => s.running);
-      const lines = live.length
-        ? live.map(([ch, s]) => `  • #${ch} — live push ON (since ${new Date(s.startedAt).toISOString()}, polling every ${Math.round(s.pollMs / 1000)}s)`).join("\n")
-        : "  (no channels are live-pushing right now)";
-      const text =
-        `Delivery status (best-effort — reports what this bridge is running, not guaranteed end-to-end delivery):\n${lines}\n\n` +
-        `• Live push ON = new messages are injected into this session as they arrive, even while idle.\n` +
-        `• Any channel NOT listed above is poll-only from this session: you see its messages only when you call check_messages, or while blocked inside wait_for_reply.\n` +
-        `• A backgrounded wait_for_reply is also real listening while it is live, but only the session holding that wait knows about it — it is not tracked here.`;
-      return { content: [{ type: "text", text }] };
+      const age = lastByteAt ? Math.round((Date.now() - lastByteAt) / 1000) : "n/a";
+      const chanLines = [...channels]
+        .sort()
+        .map((c) => `  • #${c}${c === inbox ? " (inbox)" : ""}`)
+        .join("\n") || "  (none)";
+      return textResult(
+        `Delivery status (best-effort — reports what is registered/running in this bridge, not proof that every push reaches the model — a dropped notification or a dead stream cannot be seen from here):\n` +
+          `mode: ${mode}\n` +
+          `connected: ${connected}\n` +
+          `seconds since last byte: ${age}\n` +
+          `reconnects: ${reconnects}\n` +
+          `last error: ${lastError || "none"}\n` +
+          `cursor: ${cursor}\n` +
+          `delivered: ${delivered}\n` +
+          `channels:\n${chanLines}\n\n` +
+          `• Live push ON = new messages are injected into this session as they arrive, even while idle.\n` +
+          `• Any channel NOT listed above is poll-only from this session: you see its messages only when you call check_messages, or while blocked inside wait_for_reply.`
+      );
     }
   );
 
@@ -158,25 +478,35 @@ async function main() {
   await mcp.connect(transport);
 
   const shutdown = () => {
-    for (const state of loops.values()) state.running = false;
-    loops.clear();
+    stopping = true;
+    if (watchdog) clearInterval(watchdog);
+    if (identityTimer) clearInterval(identityTimer);
+    if (registerTimer) clearInterval(registerTimer);
+    if (retryTimer) clearTimeout(retryTimer);
+    if (pollTimer) clearTimeout(pollTimer);
+    if (ctl) ctl.abort();
     process.exit(0);
   };
   transport.onclose = shutdown;
   process.stdin.on("end", shutdown);
   process.stdin.on("close", shutdown);
 
-  if (BRIDGE_AUTOSTART && BRIDGE_CHANNEL) {
-    try {
-      await startListening(BRIDGE_CHANNEL);
-      console.error(`auto-started live listening on #${BRIDGE_CHANNEL}`);
-    } catch (err) {
-      console.error(`auto-start failed for #${BRIDGE_CHANNEL}: ${err.message} (bridge stays up, idle)`);
+  log(`starting v${VERSION} as ${instanceId} (inbox dm-${instanceId}) against ${BASE}`);
+  void register();
+  watchdog = setInterval(() => {
+    if (connected && ctl && Date.now() - lastByteAt > WATCHDOG_MS) {
+      abortReason = "stalled";
+      ctl.abort();
     }
-  }
+  }, 5000);
+  if (!FIXED_ID) identityTimer = setInterval(refreshIdentity, IDENTITY_MS);
+  registerTimer = setInterval(() => void register(), REGISTER_MS);
+  connectNow();
 }
 
-main().catch((err) => {
-  console.error(`Fatal error: ${err.message}`);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((err) => {
+    process.stderr.write(`Fatal error: ${err.message}\n`);
+    process.exit(1);
+  });
+}
