@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""List live Claude Code sessions across every ~/.claude* account config dir.
+
+Each session writes <configdir>/sessions/<pid>.json. Only *.json files are
+read; the sibling <pid>.<hash>.key files are never opened. Each row's ADDRESS
+is usable as SendMessage({to: "uds:<socket path>"}).
+"""
+
+import argparse
+import glob
+import json
+import os
+import subprocess
+import sys
+import time
+
+MAX_ANCESTRY_STEPS = 20
+NO_LIVE_MESSAGE = "no live sessions found"
+
+
+def find_session_dirs(home):
+    """Return (config_dir, sessions_dir) pairs, deduped by realpath of sessions_dir."""
+    pairs = []
+    seen = set()
+    for config_dir in sorted(glob.glob(os.path.join(home, ".claude*"))):
+        sessions_dir = os.path.join(config_dir, "sessions")
+        if not os.path.isdir(config_dir) or not os.path.isdir(sessions_dir):
+            continue
+        real = os.path.realpath(sessions_dir)
+        if real in seen:
+            continue
+        seen.add(real)
+        pairs.append((config_dir, sessions_dir))
+    return pairs
+
+
+def read_session_file(path):
+    """Return the parsed session dict, or None if the file is unreadable or invalid."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    pid = data.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    return data
+
+
+def collect(home):
+    """Return (session_dir_pairs, [(config_dir, data)], unreadable_count)."""
+    dirs = find_session_dirs(home)
+    sessions = []
+    unreadable = 0
+    seen_pids = set()
+    for config_dir, sessions_dir in dirs:
+        for path in sorted(glob.glob(os.path.join(sessions_dir, "*.json"))):
+            if not os.path.isfile(path):
+                continue
+            data = read_session_file(path)
+            if data is None:
+                unreadable += 1
+                continue
+            pid = data["pid"]
+            if pid in seen_pids:
+                continue
+            seen_pids.add(pid)
+            sessions.append((config_dir, data))
+    return dirs, sessions, unreadable
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def ancestry_pids():
+    """Return the set of PIDs in this script's process ancestry (bounded walk)."""
+    pids = set()
+    pid = os.getppid()
+    for _ in range(MAX_ANCESTRY_STEPS):
+        if pid <= 1:
+            break
+        pids.add(pid)
+        try:
+            out = subprocess.run(
+                ["ps", "-o", "ppid=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            ).stdout.strip()
+            parent = int(out)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            break
+        pid = parent
+    return pids
+
+
+def str_field(data, key):
+    value = data.get(key)
+    return value if isinstance(value, str) else ""
+
+
+def build_rows(sessions, self_pids):
+    rows = []
+    for config_dir, data in sessions:
+        pid = data["pid"]
+        sock = str_field(data, "messagingSocketPath")
+        live = pid_alive(pid) and bool(sock) and os.path.exists(sock)
+        cwd = str_field(data, "cwd")
+        started = data.get("startedAt")
+        if isinstance(started, bool) or not isinstance(started, int):
+            started = None
+        rows.append(
+            {
+                "name": str_field(data, "name"),
+                "account": os.path.basename(config_dir),
+                "config_dir": config_dir,
+                "pid": pid,
+                "status": str_field(data, "status"),
+                "entrypoint": str_field(data, "entrypoint"),
+                "kind": str_field(data, "kind"),
+                "project": os.path.basename(cwd.rstrip("/")),
+                "cwd": cwd,
+                "started_at_ms": started,
+                "address": "uds:" + sock,
+                "live": live,
+                "self": pid in self_pids,
+            }
+        )
+    return rows
+
+
+def matches_filter(row, needle):
+    if not needle:
+        return True
+    needle = needle.lower()
+    return needle in row["name"].lower() or needle in row["project"].lower()
+
+
+def fmt_age(started_ms, now):
+    if started_ms is None:
+        return "?"
+    secs = max(0.0, now - started_ms / 1000.0)
+    if secs < 60:
+        return "<1m"
+    if secs < 3600:
+        return f"{int(secs // 60)}m"
+    if secs < 86400:
+        return f"{int(secs // 3600)}h"
+    return f"{int(secs // 86400)}d"
+
+
+def render_table(rows, now):
+    headers = ["NAME", "ACCOUNT", "STATUS", "ENTRY", "PROJECT", "AGE", "ADDRESS"]
+    body = []
+    for row in rows:
+        name = row["name"] + (" (you)" if row["self"] else "")
+        status = row["status"] if row["live"] else "dead"
+        body.append(
+            [
+                name,
+                row["account"],
+                status,
+                row["entrypoint"],
+                row["project"],
+                fmt_age(row["started_at_ms"], now),
+                row["address"],
+            ]
+        )
+    widths = [max([len(headers[i])] + [len(line[i]) for line in body]) for i in range(len(headers))]
+    lines = []
+    for line in [headers] + body:
+        cells = [cell.ljust(widths[i]) for i, cell in enumerate(line[:-1])]
+        cells.append(line[-1])
+        lines.append("  ".join(cells).rstrip())
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="List live Claude Code sessions across all account dirs.")
+    parser.add_argument("filter", nargs="?", default="", help="case-insensitive substring of NAME or PROJECT")
+    parser.add_argument("--json", action="store_true", help="print a JSON array instead of a table")
+    parser.add_argument("--all", action="store_true", help="include dead sessions")
+    parser.add_argument("--exclude-self", action="store_true", help="drop the current session")
+    args = parser.parse_args(argv)
+
+    home = os.path.expanduser("~")
+    dirs, sessions, unreadable = collect(home)
+    if unreadable:
+        print(f"warning: {unreadable} unreadable session file(s)", file=sys.stderr)
+    if not dirs:
+        print("no ~/.claude*/sessions directory found", file=sys.stderr)
+        return 2
+
+    now = time.time()
+    rows = build_rows(sessions, ancestry_pids())
+    rows = [row for row in rows if matches_filter(row, args.filter)]
+    if args.exclude_self:
+        rows = [row for row in rows if not row["self"]]
+    if not args.all:
+        rows = [row for row in rows if row["live"]]
+    rows.sort(key=lambda row: (row["account"], row["name"]))
+
+    if args.json:
+        payload = [
+            {
+                key: row[key]
+                for key in (
+                    "name",
+                    "account",
+                    "config_dir",
+                    "pid",
+                    "status",
+                    "entrypoint",
+                    "kind",
+                    "project",
+                    "cwd",
+                    "started_at_ms",
+                    "address",
+                    "live",
+                    "self",
+                )
+            }
+            for row in rows
+        ]
+        print(json.dumps(payload, indent=2))
+    if not rows:
+        print(NO_LIVE_MESSAGE, file=sys.stderr)
+        return 1
+    if not args.json:
+        print(render_table(rows, now))
+        live_rows = [row for row in rows if row["live"]]
+        account_count = len({row["config_dir"] for row in live_rows})
+        print(
+            f"{len(live_rows)} live session(s) across {account_count} account dir(s). "
+            "Send with SendMessage to the ADDRESS value."
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
