@@ -4,7 +4,6 @@ import { z } from "zod";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { pathToFileURL } from "url";
 
 // Cross-claude live-delivery bridge (stdio MCP server, v0.3.0).
 // Holds ONE SSE connection to the server and pushes every new message into the session
@@ -504,7 +503,17 @@ async function main() {
   connectNow();
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Compare REAL paths: launched through a symlinked dir (hive: ~/Projects -> laptop-mirror),
+// argv[1] keeps the symlink while import.meta.url is resolved, so a plain compare never matches
+// and the bridge would exit silently without starting.
+const isDirectRun = () => {
+  try {
+    return !!process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(new URL(import.meta.url));
+  } catch {
+    return false;
+  }
+};
+if (isDirectRun()) {
   main().catch((err) => {
     process.stderr.write(`Fatal error: ${err.message}\n`);
     process.exit(1);
