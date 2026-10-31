@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { ensureIdentity, loadIdentity, writeTrusted, signEnvelope, parseEnvelope } from "./trust.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER = join(__dirname, "..", "server.mjs");
@@ -17,6 +18,16 @@ const INSTANCE = "tester-box";
 const INBOX = `dm-${INSTANCE}`;
 // Server runs with this static key so the bridge's Bearer header is accepted (server.mjs rejects Bearer without it).
 const TEST_KEY = "test-key";
+// Trust fixtures: BRIDGE_ID is the receiving bridge's own identity; PEER_ID signs every simulated peer.
+// Temp config/state dirs only; the real ~/.config/cross-claude is never touched.
+const CFG_DIR = join(TEMP_HOME, ".config", "cross-claude");
+const STATE_DIR = join(TEMP_HOME, ".local", "state", "cross-claude");
+const TEST_ENV = { CROSS_CLAUDE_CONFIG_DIR: CFG_DIR, CROSS_CLAUDE_STATE_DIR: STATE_DIR };
+const BRIDGE_ID = "tester-box";
+const PEER_ID = "peer-sim";
+let KEYS_B64 = "";
+let PEER_PEM = "";
+let PEER_BEARER = "";
 const AUTH_NAME = "Author" + "ization";
 const AUTH_SCHEME = "Bea" + "rer";
 
@@ -54,6 +65,17 @@ async function api(method, path, body) {
   return { status: res.status, data };
 }
 
+// A simulated peer message: signed by PEER_ID, posted with PEER_ID's bearer so the server stamps sender_key_id.
+async function postSigned(channel, sender, body) {
+  const content = signEnvelope({ from_key: PEER_ID, from_instance: sender, channel, body }, PEER_PEM);
+  const res = await fetch(`${BASE}/api/messages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", [AUTH_NAME]: AUTH_SCHEME + " " + PEER_BEARER },
+    body: JSON.stringify({ channel, sender, content, message_type: "message" }),
+  });
+  return res.status;
+}
+
 function killPort() {
   const r = spawnSync("lsof", ["-ti", `:${PORT}`], { encoding: "utf-8" });
   for (const pid of (r.stdout || "").trim().split("\n").filter(Boolean)) spawnSync("kill", ["-9", pid]);
@@ -63,7 +85,7 @@ function startServer() {
   return new Promise((resolve, reject) => {
     const proc = spawn("node", [SERVER], {
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, PORT: String(PORT), HOME: TEMP_HOME, STREAM_HEARTBEAT_MS: "500", MCP_API_KEY: TEST_KEY }
+      env: { ...process.env, PORT: String(PORT), HOME: TEMP_HOME, STREAM_HEARTBEAT_MS: "500", MCP_API_KEY: TEST_KEY, CROSS_CLAUDE_KEYS: KEYS_B64 }
     });
     const timeout = setTimeout(() => reject(new Error("server start timeout")), 10000);
     proc.stdout.on("data", (data) => {
@@ -82,6 +104,15 @@ const pushes = [];
 
 async function runTests() {
   console.log("Bridge v2 test suite\n");
+  const bridgeIdent = ensureIdentity(BRIDGE_ID, { env: TEST_ENV, home: TEMP_HOME });
+  const peerIdent = ensureIdentity(PEER_ID, { env: TEST_ENV, home: TEMP_HOME });
+  writeTrusted({ [BRIDGE_ID]: bridgeIdent.pub, [PEER_ID]: peerIdent.pub }, TEST_ENV, TEMP_HOME);
+  const peer = loadIdentity(PEER_ID, TEST_ENV, TEMP_HOME);
+  PEER_PEM = peer.privateKeyPem;
+  PEER_BEARER = peer.bearer;
+  KEYS_B64 = Buffer.from(
+    JSON.stringify({ [BRIDGE_ID]: bridgeIdent.bearerSha256, [PEER_ID]: peerIdent.bearerSha256 })
+  ).toString("base64");
   killPort();
   server = await startServer();
 
@@ -92,6 +123,9 @@ async function runTests() {
       CROSS_CLAUDE_URL: BASE,
       CROSS_CLAUDE_API_KEY: "test-key",
       BRIDGE_INSTANCE: INSTANCE,
+      BRIDGE_IDENTITY: BRIDGE_ID,
+      CROSS_CLAUDE_CONFIG_DIR: CFG_DIR,
+      CROSS_CLAUDE_STATE_DIR: STATE_DIR,
       HOME: TEMP_HOME,
       PATH: process.env.PATH
     }
@@ -123,7 +157,7 @@ async function runTests() {
 
     // 3. REST post to our inbox arrives as a push.
     console.log("3. inbox push from REST");
-    await api("POST", "/messages", { channel: INBOX, sender: "alice", content: "hi-from-alice", message_type: "message" });
+    await postSigned(INBOX, "alice", "hi-from-alice");
     const got3 = await waitFor(() => pushed((p) => p.meta?.sender === "alice" && p.content.includes("hi-from-alice")), 1500);
     assert(got3, "DM from alice pushed within 1500 ms");
     const p3 = pushes.find((p) => p.meta?.sender === "alice");
@@ -134,19 +168,19 @@ async function runTests() {
     const sendOut = await text("send", { to: "bob-box", message: "ping-from-tester" });
     assert(sendOut.startsWith("Sent #"), `send returned "${sendOut}"`);
     const bobMsgs = await api("GET", "/messages/dm-bob-box?limit=5");
-    const bobHit = (bobMsgs.data.messages || []).find((m) => m.content === "ping-from-tester");
-    assert(bobHit !== undefined && bobHit.sender === INSTANCE, "message on dm-bob-box has sender tester-box");
+    const bobHit = (bobMsgs.data.messages || []).find((m) => parseEnvelope(m.content)?.p?.body === "ping-from-tester");
+    assert(bobHit !== undefined && bobHit.sender === INSTANCE, "message on dm-bob-box is a signed envelope with body ping-from-tester, sender tester-box");
 
     // 5. listen_live / stop_listening on a channel.
     console.log("5. listen_live and stop_listening");
     await text("listen_live", { channel: "general" });
     await sleep(800);
-    await api("POST", "/messages", { channel: "general", sender: "carol", content: "gen-on-1", message_type: "message" });
+    await postSigned("general", "carol", "gen-on-1");
     const got5 = await waitFor(() => pushed((p) => p.meta?.channel === "general" && p.content.includes("gen-on-1")), 1500);
     assert(got5, "general post from carol pushed after listen_live");
     await text("stop_listening", { channel: "general" });
     await sleep(800);
-    await api("POST", "/messages", { channel: "general", sender: "carol", content: "gen-off-2", message_type: "message" });
+    await postSigned("general", "carol", "gen-off-2");
     const got5b = await waitFor(() => pushed((p) => p.content.includes("gen-off-2")), 1000);
     assert(!got5b, "general post after stop_listening is NOT pushed within 1000 ms");
 
@@ -161,7 +195,7 @@ async function runTests() {
     server.kill("SIGTERM");
     await sleep(1000);
     server = await startServer();
-    await api("POST", "/messages", { channel: INBOX, sender: "dave", content: "after-restart-7", message_type: "message" });
+    await postSigned(INBOX, "dave", "after-restart-7");
     const got7 = await waitFor(() => pushed((p) => p.content.includes("after-restart-7")), 10000);
     assert(got7, "DM from dave pushed within 10000 ms after server restart");
     const status = await text("delivery_status");

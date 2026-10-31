@@ -5,12 +5,27 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { spawn } from "child_process";
+import {
+  audit,
+  createNonceStore,
+  identityFor,
+  isKilled,
+  loadIdentity,
+  loadTrusted,
+  readBearer,
+  recordDrop,
+  sha8,
+  signEnvelope,
+  verifyEnvelope,
+} from "./trust.mjs";
 
-// Cross-claude live-delivery bridge (stdio MCP server, v0.3.0).
+// Cross-claude live-delivery bridge (stdio MCP server, v0.4.0).
 // Holds ONE SSE connection to the server and pushes every new message into the session
 // as notifications/claude/channel. Reconnects with backoff and resumes from a cursor.
+// Gates 2-5 (docs/plans/bridge-trust.md): only messages signed by a trusted identity are delivered.
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
+const BODY_CAP = 65536;
 const DEFAULT_URL = "https://cross-claude-mcp-production.up.railway.app";
 const AUTH_HEADER = "Authorization";
 const SCHEME_RE = /^\S+\s+/;
@@ -88,7 +103,17 @@ function sessionNameFor(home, ppid) {
 
 async function main() {
   const home = process.env.HOME || os.homedir();
-  const credential = findApiKey(process.env, home);
+  const HOST = os.hostname();
+  // Trust identity: one per (host, Claude config dir). Null when no parent session is found.
+  let identityName = null;
+  try {
+    identityName = identityFor(home, process.ppid, HOST);
+  } catch {
+    identityName = null;
+  }
+  const identityBearer = identityName ? readBearer(identityName) : null;
+  const ident = identityName ? loadIdentity(identityName) : null;
+  const credential = identityBearer || findApiKey(process.env, home);
   if (!credential) {
     process.stderr.write("cross-claude-bridge: no API key found (checked CROSS_CLAUDE_API_KEY, ~/.config/cross-claude/mcp.json, ~/.claude*/plugins/cache/cross-claude-local/cross-claude/*/.mcp.json)\n");
     process.exit(1);
@@ -96,7 +121,6 @@ async function main() {
 
   const BASE = (process.env.CROSS_CLAUDE_URL || DEFAULT_URL).replace(/\/+$/, "");
   const headers = { [AUTH_HEADER]: `Bearer ${credential}` };
-  const HOST = os.hostname();
   const SHORT_HOST = slug(HOST.split(".")[0]);
   const FIXED_ID = process.env.BRIDGE_INSTANCE || null;
   const NO_INBOX = process.env.BRIDGE_NO_INBOX === "1";
@@ -138,6 +162,11 @@ async function main() {
   if (!NO_INBOX) channels.add(inbox);
   if (AUTOSTART && BRIDGE_CHANNEL) channels.add(BRIDGE_CHANNEL);
 
+  const aud = (event, f = {}) => audit(event, { identity: identityName, ...f });
+  const drop = (reason, f = {}) => recordDrop(reason, { identity: identityName, ...f });
+  const nonceStore = createNonceStore();
+  let serverKilled = false;
+
   const seen = new Set();
   let cursor = 0;
   let cursorReady = false;
@@ -168,7 +197,11 @@ async function main() {
     const h = { ...headers };
     if (init.body) h["Content-Type"] = "application/json";
     const res = await fetch(`${BASE}${p}`, { ...init, headers: h });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.ok) {
+      const err = new Error(`HTTP ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
     return res.json();
   };
 
@@ -178,13 +211,40 @@ async function main() {
     seen.add(id);
     if (seen.size > SEEN_CAP) seen.delete(seen.values().next().value);
     if (id > cursor) cursor = id;
-    let content = `[#${m.channel}] ${m.sender}: ${m.content}`;
+    const raw = String(m.content ?? "");
+    if (isKilled()) {
+      drop("killed", { sender_instance: String(m.sender), msg_id: id, sha8: sha8(raw) });
+      return;
+    }
+    const v = verifyEnvelope(raw, {
+      channel: m.channel,
+      trusted: loadTrusted(),
+      nonceStore,
+      serverKeyId: m.sender_key_id ?? null,
+    });
+    if (!v.ok) {
+      drop(v.reason, { sender_instance: String(m.sender), msg_id: id, sha8: sha8(raw) });
+      return;
+    }
+    const p = v.p;
+    aud("deliver", {
+      reason: "ok",
+      sender_key: p.from_key,
+      sender_instance: p.from_instance,
+      msg_id: id,
+      sha8: sha8(p.body),
+    });
+    // Body sits inside a per-message random delimiter, so it cannot fake the closing marker or a header.
+    const nonce8 = p.nonce.slice(0, 8);
+    let content =
+      `[#${m.channel}] message from ${p.from_instance} (verified key ${p.from_key}):\n` +
+      `<<<CROSS-CLAUDE-BODY ${nonce8}\n${p.body}\nCROSS-CLAUDE-BODY ${nonce8}>>>`;
     if (m.channel === inbox) {
-      content += `\n\n(Direct message to you. Reply with the cross-claude-bridge "send" tool, to="${m.sender}".)`;
+      content += `\n\n(Direct message to you. Reply with the cross-claude-bridge "send" tool, to="${p.from_instance}".)`;
     }
     const meta = {
       channel: String(m.channel),
-      sender: String(m.sender),
+      sender: String(p.from_instance),
       id: String(id),
       message_type: String(m.message_type ?? "message"),
       in_reply_to: m.in_reply_to == null ? "" : String(m.in_reply_to),
@@ -325,6 +385,7 @@ async function main() {
     if (mode !== "poll" || stopping) return;
     const batch = [];
     let failed = false;
+    let killedHit = false;
     for (const ch of [...channels]) {
       try {
         const qs = new URLSearchParams({ after_id: String(cursor), instance_id: instanceId });
@@ -333,7 +394,14 @@ async function main() {
       } catch (e) {
         failed = true;
         lastError = e.message;
+        if (e.status === 503) killedHit = true;
       }
+    }
+    if (killedHit) {
+      serverKilled = true;
+      drop("killed", {});
+    } else if (!failed) {
+      serverKilled = false;
     }
     batch.sort((a, b) => Number(a.id) - Number(b.id));
     for (const m of batch) deliver(m);
@@ -368,7 +436,16 @@ async function main() {
         switchToPoll();
         return;
       }
+      if (res.status === 503) {
+        const j = await res.json().catch(() => null);
+        if (j?.error === "killed") {
+          serverKilled = true;
+          drop("killed", {});
+          throw new Error("server killed (503)");
+        }
+      }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      serverKilled = false;
       connected = true;
       lastByteAt = Date.now();
       const reader = res.body.getReader();
@@ -457,18 +534,26 @@ async function main() {
     },
     async ({ to, message, in_reply_to }) => {
       try {
+        if (isKilled()) return textResult("Send failed: killed (KILL file present on this host)");
+        if (!ident) return textResult(`Send failed: no identity key: run cc-bridge-keys init`);
+        if (Buffer.byteLength(String(message), "utf8") > BODY_CAP) return textResult("Send failed: body exceeds 64 KB");
         const channel = to.startsWith("#") ? normChannel(to.slice(1)) : `dm-${to}`;
         if (!channel || channel === "dm-") return textResult("Send failed: empty destination");
+        const content = signEnvelope(
+          { from_key: identityName, from_instance: instanceId, channel, body: message },
+          ident.privateKeyPem
+        );
         const r = await api("/api/messages", {
           method: "POST",
           body: JSON.stringify({
             channel,
             sender: instanceId,
-            content: message,
+            content,
             message_type: "message",
             ...(in_reply_to != null ? { in_reply_to } : {}),
           }),
         });
+        aud("send", { receiver: to, msg_id: r.id, sha8: sha8(message) });
         return textResult(`Sent #${r.id} to ${to}`);
       } catch (e) {
         return textResult(`Send failed: ${e.message}`);
@@ -558,6 +643,9 @@ async function main() {
           `last error: ${lastError || "none"}\n` +
           `cursor: ${cursor}\n` +
           `delivered: ${delivered}\n` +
+          `identity: ${identityName ?? "none (no parent session, no BRIDGE_IDENTITY): delivering nothing"}${identityName && !ident ? " (no private key: send disabled)" : ""}\n` +
+          `trusted keys: ${Object.keys(loadTrusted()).length}\n` +
+          `kill: ${isKilled() ? "file (KILL present on this host)" : serverKilled ? "server (CROSS_CLAUDE_KILL)" : "off"}\n` +
           `delivery: ${DELIVERY}` +
           (DELIVERY !== "channel"
             ? ` (courier ok: ${couriered}, failed: ${courierFailures}, queued: ${courierQueue.length}${courierLastError ? `, last error: ${courierLastError}` : ""})`
@@ -588,6 +676,12 @@ async function main() {
   process.stdin.on("close", shutdown);
 
   log(`starting v${VERSION} as ${instanceId} (inbox dm-${instanceId}) against ${BASE}`);
+  const trustedCount = Object.keys(loadTrusted()).length;
+  aud("start", { reason: "ok", trusted_count: trustedCount, delivery: DELIVERY, version: VERSION });
+  if (!identityName) log("no trust identity (no parent session, no BRIDGE_IDENTITY): delivering nothing");
+  else if (!ident) log(`no private key for identity ${identityName}: run cc-bridge-keys init (send disabled)`);
+  if (trustedCount === 0) log("trusted_keys.json missing or empty: delivering nothing (fail closed)");
+  if (isKilled()) log("KILL file present: delivering nothing and sending nothing");
   void register();
   watchdog = setInterval(() => {
     if (connected && ctl && Date.now() - lastByteAt > WATCHDOG_MS) {
