@@ -29,6 +29,13 @@ Anything else silently drops the push, even though the bridge shows `connected: 
 - A session launched with a parent CC session's environment leaked in, e.g. from a tmux server first started inside a CC session: "waiting for your organization's policy … Messages are dropped until it loads".
 - Works: a laptop `ccx` or plain `claude` started from a clean environment; on hive, plain `claude` with those three vars unset (it uses `~/.claude/.credentials.json`). Check the banner and the "Channels (experimental) messages from … inject directly" line before trusting delivery.
 
+### Courier delivery: for sessions that can't receive channel pushes (bridge 70f2d58, verified live 2026-10-31)
+Set `BRIDGE_DELIVERY=sendmessage` in the bridge's MCP `env`. Each message then goes through a headless courier: `claude -p --model haiku --tools SendMessage --strict-mcp-config --setting-sources "" --no-session-persistence`. The courier delivers to the parent session's native socket (`sessions/<ppid>.json` → `messagingSocketPath`), and the idle session wakes the way it does for any SendMessage.
+- Works on setup-token auth: laptop r@ `ccx`, hive plain `ccx`. Needs NO dev-channel flag and NO prompt.
+- About 5 s per message. Serial queue capped at 50, 120 s timeout per courier, and the parent's identity env vars are stripped. SendMessage is the courier's only tool, so injected instructions can't be acted on (tested).
+- The receiver must be in the courier's permission mode (bypass). Otherwise the message is held.
+- Verified: a fresh r@ setup-token session <-> hive claude@ `--claudeai` (#5722), and the same r@ session <-> hive PLAIN `ccx` with the courier on both ends (#5724).
+
 ### Launching a receiving session with ccx (claude-optimization d51c99a; verified live 2026-10-31)
 1. Opt the project in: put `{"defaults":{"bridge_autoload":"on"}}` in its `.claude-profile.json`. It's off by default, because the dev-channel prompt would hang headless launches.
 2. Laptop: `ccx` (or `ccm` / `ccc` for the other accounts). Hive: `ccx --claudeai`. Without that flag, hive ccx skips the bridge and prints why.
