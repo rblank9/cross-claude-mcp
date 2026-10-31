@@ -29,6 +29,12 @@ Anything else silently drops the push, even though the bridge shows `connected: 
 - A session launched with a parent CC session's environment leaked in, e.g. from a tmux server first started inside a CC session: "waiting for your organization's policy … Messages are dropped until it loads".
 - Works: a laptop `ccx` or plain `claude` started from a clean environment; on hive, plain `claude` with those three vars unset (it uses `~/.claude/.credentials.json`). Check the banner and the "Channels (experimental) messages from … inject directly" line before trusting delivery.
 
+### Launching a receiving session with ccx (claude-optimization d51c99a; verified live 2026-10-31)
+1. Opt the project in: put `{"defaults":{"bridge_autoload":"on"}}` in its `.claude-profile.json`. It's off by default, because the dev-channel prompt would hang headless launches.
+2. Laptop: `ccx` (or `ccm` / `ccc` for the other accounts). Hive: `ccx --claudeai`. Without that flag, hive ccx skips the bridge and prints why.
+3. Press Enter at "I am using this for local development".
+Verified: an idle laptop mark@ session and an idle hive claude@ session woke each other through ccx auto-load (#5719 / #5720). Known gap (2026-10-31): on the laptop, the default r@ account had no usable login in a fresh shell ("Not logged in"). It needs `/login` before an r@ session can receive anything.
+
 ## What it is
 
 Claude Code's experimental **Channels** feature lets a trusted MCP server PUSH inbound messages into a running CC session — `notifications/claude/channel`, event-driven, no polling. cross-claude-mcp implements it so subscribed instances get **live** message delivery instead of `wait_for_reply` polling. The poll path is untouched and remains the universal fallback for non-channel clients.
