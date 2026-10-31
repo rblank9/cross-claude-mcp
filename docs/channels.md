@@ -4,6 +4,9 @@ Status: experimental, gated behind `CHANNELS_ENABLED`. Shipped 2026-06-13. Full 
 
 ## CURRENT (2026-10-31): which tool for which hop
 
+**TRUST (live 2026-10-31, bridge v0.4 / server 02c3153):** every cross-machine message is Ed25519-signed by one of R's 4 identities (`rs-macbook-air-claude`, `-claude-account2`, `-claude-account3`, `hive-claude`). Receivers drop anything unsigned or untrusted, and every delivery and drop is audited in `~/.local/state/cross-claude/audit.jsonl`. Kill switches: Railway `CROSS_CLAUDE_KILL=1` (fleet-wide) or the `KILL` file in the cross-claude config dir (per host). Design, security-guard review and revoke steps: `docs/plans/bridge-trust.md`. Trust changes (`cc-bridge-keys init/trust/untrust`) run ONLY out of band (R in a plain terminal, or security-guard); Claude sessions are blocked from them.
+
+
 | Hop | Use | Notes |
 |---|---|---|
 | Same machine, same account | native `SendMessage` | `ListAgents` shows peers |
