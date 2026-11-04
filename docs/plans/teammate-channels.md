@@ -16,7 +16,7 @@ Gates 1-5 assume every key-holder is R. Two things break when a second person ho
 Vicky's Mac runs `cc-bridge-keys init` out of band → identity `vicky-<host>-claude` (Ed25519 keypair + bearer, never leave his Mac). R adds the bearer's sha256 to `CROSS_CLAUDE_KEYS`; R adds the pubkey to receivers. Same as R's four identities today.
 
 ### Gate 6 (server): per-key channel scope — NEW
-- Env `CROSS_CLAUDE_SCOPES` = `{"<keyId>": ["team-syb", ...]}` (plain Railway var; not a secret). Exact channel names; optional `team-*` prefix rule TBD with SG.
+- Env `CROSS_CLAUDE_SCOPES` = `{"<keyId>": ["team-syb", ...]}` (not a secret; svc item field, via sg_secrets set, like `CROSS_CLAUDE_KEYS`). Exact channel names; optional `team-*` prefix rule TBD with SG.
 - A key **with** a scope entry is a scoped (teammate) key. A key **without** one keeps today's behavior (R's identities). Absent env = no scoped keys.
 - Scoped key, per route:
   - `POST /messages`: channel must be in scope, else 403 `{"error":"out_of_scope"}`.
@@ -48,7 +48,7 @@ His `trusted_keys.json` holds R's identities as **teammate-tier entries scoped t
 
 ### Audit / kill / revoke
 - New drop reason `out_of_scope` → audit contract **v bump to v:2**; sg-watch pages on it (a teammate key probing outside scope is a signal). New server-side log line on every 403 `out_of_scope` with keyId + route.
-- Kill: existing fleet + host switches cover it. Revoke Vicky = remove from `CROSS_CLAUDE_KEYS` + `CROSS_CLAUDE_SCOPES`, redeploy, remove from every `trusted_keys.json`.
+- Kill: existing fleet + host switches cover it. Revoke Vicky = remove from the `CROSS_CLAUDE_KEYS` + `CROSS_CLAUDE_SCOPES` svc item fields (via sg_secrets set), redeploy, remove from every `trusted_keys.json`.
 
 ## Build order (after SG sign-off)
 1. Gate 6 server + tests; deploy; prove a scoped test key gets 403 on `dm-*`, `/data`, `/mcp` and 200 on `team-syb`.

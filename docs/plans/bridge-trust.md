@@ -10,7 +10,7 @@ Goal: a message is delivered into a Claude session only if one of R's own hosts 
 - `bin/cc-bridge-keys init` generates both locally and prints the public key, the token's sha256, and the id. It never prints the private key or the token.
 
 ## Gate 1: per-identity bearer keys, server stamps the key id
-- Server env `CROSS_CLAUDE_KEYS` = JSON `{"<id>": "<sha256 hex of token>"}`. These are hashes, not secrets, so it is a plain Railway variable. Revoke one identity by deleting its entry and redeploying.
+- Server env `CROSS_CLAUDE_KEYS` = JSON `{"<id>": "<sha256 hex of token>"}`. These are hashes, not secrets, but since 2026-11-04 they live in the 1Password svc item field (loaded at boot by op-exec), set via `python3 sg_secrets.py set cross-claude-mcp/cross-claude-mcp <KEY>` (value on stdin, from security-guard/secret-injection). There is no plain Railway var. Revoke one identity by deleting its entry via sg_secrets set and redeploying.
 - The auth middleware hashes the presented bearer and looks it up: on a hit `req.keyId = <id>`; the legacy `MCP_API_KEY` gives `"legacy"`; OAuth gives `"oauth"`.
 - New nullable column `messages.sender_key_id`. Postgres gets `ALTER TABLE … ADD COLUMN IF NOT EXISTS`; sqlite gets a guarded ADD COLUMN.
 - Stamping happens in db.mjs through AsyncLocalStorage set by the auth middleware, so `tools.mjs` (shared with SaaS) is untouched. The stamp is included in the `/api/stream` and `/api/messages` payloads.
@@ -47,7 +47,7 @@ Goal: a message is delivered into a Claude session only if one of R's own hosts 
 - **Domain separation:** signed bytes = `"ccsig1\n" + canonical JSON`. The nonce store is its own file (`~/.local/state/cross-claude/nonces.json`) and covers at least the 10-min window across a restart. Tested by replaying a message after restarting the bridge.
 - **Body cap:** 64 KB. Larger bodies are dropped with reason `oversize`.
 - **Out-of-band only:** trust bootstrapping and revocation go through `cc-bridge-keys` + ssh, never over the bridge.
-  - Revoke steps: remove the id from `CROSS_CLAUDE_KEYS` and redeploy; remove it from `trusted_keys.json` on every host; confirm the old key now gets an `unknown_key` drop.
+  - Revoke steps: remove the id from the `CROSS_CLAUDE_KEYS` svc item field (via sg_secrets set) and redeploy; remove it from `trusted_keys.json` on every host; confirm the old key now gets an `unknown_key` drop.
 - **Audit contract (sg-watch reads it):**
   - Path: `~/.local/state/cross-claude/audit.jsonl`, append-only. Rotation renames to `audit.jsonl.YYYYMMDD`.
   - Every line carries `v:1`, `host`, `identity`, and `ts` (ISO-8601 UTC, `Z`).
