@@ -257,6 +257,14 @@ class SqliteDB {
     return this.db.prepare(`SELECT * FROM instances ORDER BY last_seen DESC`).all();
   }
 
+  listInstancesPostedIn(channels) {
+    if (channels.length === 0) return [];
+    const marks = channels.map(() => "?").join(",");
+    return this.db.prepare(
+      `SELECT * FROM instances WHERE instance_id IN (SELECT DISTINCT sender FROM messages WHERE channel IN (${marks})) ORDER BY last_seen DESC`
+    ).all(...channels);
+  }
+
   searchMessages(query, limit) {
     return this.db.prepare(
       `SELECT m.*, (SELECT COUNT(*) FROM messages r WHERE r.in_reply_to = m.id) as reply_count
@@ -511,6 +519,15 @@ class PostgresDB {
 
   async listInstances() {
     const result = await this.pool.query(`SELECT * FROM instances ORDER BY last_seen DESC`);
+    return result.rows;
+  }
+
+  async listInstancesPostedIn(channels) {
+    if (channels.length === 0) return [];
+    const result = await this.pool.query(
+      `SELECT * FROM instances WHERE instance_id IN (SELECT DISTINCT sender FROM messages WHERE channel = ANY($1)) ORDER BY last_seen DESC`,
+      [channels]
+    );
     return result.rows;
   }
 

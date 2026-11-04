@@ -15,7 +15,8 @@ const LEGACY = "legacy-" + "test";
 const TOK_BAD = "tok-" + "x";
 
 const sha256hex = (s) => createHash('sha256').update(s).digest('hex');
-const KEYS_JSON = JSON.stringify({ "host-a": sha256hex(TOK_A), "host-b": sha256hex(TOK_B) });
+const TOK_C = "tok-" + "c";
+const KEYS_JSON = JSON.stringify({ "host-a": sha256hex(TOK_A), "host-b": sha256hex(TOK_B), "host-c": sha256hex(TOK_C) });
 const CROSS_CLAUDE_KEYS = Buffer.from(KEYS_JSON).toString('base64');
 
 const assert = (cond, label) => {
@@ -87,7 +88,9 @@ const startServer = async (extraEnv) => {
 const stopServer = (proc) => {
   if (!proc || proc.exitCode !== null) return Promise.resolve();
   return new Promise((resolve) => {
-    proc.once('exit', () => resolve());
+    // SIGTERM can stall while an SSE connection is still open (seen once in a mutant run); force-kill after 3 s.
+    const t = setTimeout(() => proc.kill('SIGKILL'), 3000);
+    proc.once('exit', () => { clearTimeout(t); resolve(); });
     proc.kill();
   });
 };
@@ -381,6 +384,127 @@ const main = async () => {
     const h3 = assert(nokeysStderr().includes("no keys configured and CROSS_CLAUDE_DEV unset: all API requests will be refused"), 'h3. stderr contains warning');
     passed += h3.passed ? 1 : 0;
     failed += h3.passed ? 0 : 1;
+
+    // Scenario SCOPE (Gate 6). TOK_B: object scope, instance_prefix "vicky", with a dm-x entry and a wildcard that are dropped.
+    // TOK_C: array scope (no register, no send). TOK_A: unscoped.
+    await stopServer(serverProc);
+    serverProc = null;
+    const scopeEnv = {
+      ...mainEnv,
+      CROSS_CLAUDE_SCOPES: JSON.stringify({
+        "host-b": { channels: ["team-syb", "dm-x", "team-*"], instance_prefix: "vicky" },
+        "host-c": ["team-syb"]
+      })
+    };
+    const { proc: scopeProc, stderr: scopeStderr } = await startServer(scopeEnv);
+    serverProc = scopeProc;
+
+    // Setup, unscoped
+    await req('POST', '/api/channels', { token: TOK_A, body: { name: "team-syb" } });
+    const dmRes = await req('POST', '/api/messages', { token: TOK_A, body: { channel: "dm-x", sender: "r-sender", content: "dm-secret" } });
+    const generalRes = await req('POST', '/api/messages', { token: TOK_A, body: { channel: "general", sender: "gen-inst", content: "general-parent" } });
+    const generalId = generalRes.json?.id;
+    await req('POST', '/api/register', { token: TOK_A, body: { instance_id: "gen-inst" } });
+    const teamRes = await req('POST', '/api/messages', { token: TOK_B, body: { channel: "team-syb", sender: "vicky-one", content: "team-hello" } });
+
+    // Streams report status only (SSE body never ends), so read the status then abort.
+    const streamStatus = async (path, token) => {
+      const ctl = new AbortController();
+      try {
+        const r = await fetch(BASE + path, { signal: ctl.signal, headers: { Authorization: `Bearer ${token}` } });
+        ctl.abort();
+        return r.status;
+      } catch (e) {
+        return 500;
+      }
+    };
+
+    const scopedDenies = [
+      ['s1. scoped GET /api/messages/dm-x: 403', await req('GET', '/api/messages/dm-x?limit=5', { token: TOK_B }), 403],
+      ['s2. scoped POST /api/messages to general: 403', await req('POST', '/api/messages', { token: TOK_B, body: { channel: "general", sender: "vicky-one", content: "x" } }), 403],
+      ['s3. scoped GET /api/data: 403', await req('GET', '/api/data', { token: TOK_B }), 403],
+      ['s4. scoped POST /api/data: 403', await req('POST', '/api/data', { token: TOK_B, body: { key: "k", content: "c", sender: "v" } }), 403],
+      ['s5. scoped POST /api/channels: 403', await req('POST', '/api/channels', { token: TOK_B, body: { name: "team-new" } }), 403],
+      ['s6. scoped POST /mcp: 403', await req('POST', '/mcp', { token: TOK_B, body: {} }), 403],
+      ['s7. scoped GET replies of a dm-x message via team-syb path: 403', await req('GET', `/api/messages/team-syb/${dmRes.json?.id}/replies`, { token: TOK_B }), 403],
+      ['s8. scoped GET replies of a general message via team-syb path: 403', await req('GET', `/api/messages/team-syb/${generalId}/replies`, { token: TOK_B }), 403],
+      ['s9. scoped POST /api/messages sender not bound to prefix: 403', await req('POST', '/api/messages', { token: TOK_B, body: { channel: "team-syb", sender: "other-one", content: "x" } }), 403],
+      ['s10. array-scope key POST /api/register: 403', await req('POST', '/api/register', { token: TOK_C, body: { instance_id: "vicky-two" } }), 403],
+      ['s11. array-scope key POST /api/messages (no prefix, so no sender bound): 403', await req('POST', '/api/messages', { token: TOK_C, body: { channel: "team-syb", sender: "vicky-two", content: "x" } }), 403],
+      ['s12. scoped POST /api/register with a non-prefix name: 403', await req('POST', '/api/register', { token: TOK_B, body: { instance_id: "other-one" } }), 403],
+    ];
+    for (const [label, r, want] of scopedDenies) {
+      const t = assert(r.status === want && r.json?.error === "out_of_scope", label);
+      passed += t.passed ? 1 : 0;
+      failed += t.passed ? 0 : 1;
+    }
+
+    const s13 = assert((await streamStatus('/api/stream?channels=team-syb,general', TOK_B)) === 403, 'S13. scoped /stream?channels=team-syb,general: 403 (whole request)');
+    passed += s13.passed ? 1 : 0;
+    failed += s13.passed ? 0 : 1;
+
+    const r1 = await req('POST', '/api/register', { token: TOK_B, body: { instance_id: "vicky-one" } });
+    const r1t = assert(r1.status === 200, 'R1. scoped POST /api/register with prefix name: 200');
+    passed += r1t.passed ? 1 : 0;
+    failed += r1t.passed ? 0 : 1;
+
+    const s14 = assert(teamRes.status === 200, 'S14. scoped POST /api/messages to team-syb with bound sender: 200');
+    passed += s14.passed ? 1 : 0;
+    failed += s14.passed ? 0 : 1;
+
+    const s15Get = await req('GET', '/api/messages/team-syb?limit=100', { token: TOK_B });
+    const s15 = assert(s15Get.status === 200 && s15Get.json?.messages?.some((m) => m.content === "team-hello"), 'S15. scoped GET /api/messages/team-syb: 200 with message');
+    passed += s15.passed ? 1 : 0;
+    failed += s15.passed ? 0 : 1;
+
+    const s16 = assert((await streamStatus('/api/stream?channels=team-syb', TOK_B)) === 200, 'S16. scoped /stream?channels=team-syb: 200');
+    passed += s16.passed ? 1 : 0;
+    failed += s16.passed ? 0 : 1;
+
+    const s17Res = await req('GET', '/api/channels', { token: TOK_B });
+    const s17Names = (s17Res.json?.channels || []).map((c) => c.name);
+    const s17 = assert(s17Res.status === 200 && s17Names.includes("team-syb") && s17Names.every((n) => n === "team-syb"), 'S17. scoped /channels lists only team-syb');
+    passed += s17.passed ? 1 : 0;
+    failed += s17.passed ? 0 : 1;
+
+    const i1Res = await req('GET', '/api/instances', { token: TOK_B });
+    const i1Names = (i1Res.json?.instances || []).map((i) => i.instance_id);
+    const i1 = assert(i1Res.status === 200 && i1Names.includes("vicky-one") && !i1Names.includes("gen-inst"), 'I1. scoped /instances shows team poster, hides general-only instance');
+    passed += i1.passed ? 1 : 0;
+    failed += i1.passed ? 0 : 1;
+
+    const s18Res = await req('GET', '/api/messages/general?limit=5', { token: TOK_A });
+    const s18 = assert(s18Res.status === 200, 'S18. unscoped GET /api/messages/general: 200');
+    passed += s18.passed ? 1 : 0;
+    failed += s18.passed ? 0 : 1;
+
+    const sz = await req('POST', '/api/messages', { token: TOK_B, body: { channel: "team-syb", sender: "vicky-one", content: "x".repeat(70000) } });
+    const sz1 = assert(sz.status === 413 && sz.json?.error === "payload_too_large", 'SZ. scoped POST over 64 KB: 413');
+    passed += sz1.passed ? 1 : 0;
+    failed += sz1.passed ? 0 : 1;
+
+    // Rate: 1 send so far (teamRes) + 29 more = 30 accepted; the 30th of this loop must be refused.
+    const rateStatuses = [];
+    let rateLast = null;
+    for (let i = 0; i < 30; i += 1) {
+      rateLast = await req('POST', '/api/messages', { token: TOK_B, body: { channel: "team-syb", sender: "vicky-one", content: `burst-${i}` } });
+      rateStatuses.push(rateLast.status);
+    }
+    const rl = assert(rateStatuses.slice(0, 29).every((x) => x === 200) && rateStatuses[29] === 429 && rateLast?.json?.error === "rate_limited", 'RL. scoped sends: 30th within window refused 429 rate_limited');
+    passed += rl.passed ? 1 : 0;
+    failed += rl.passed ? 0 : 1;
+
+    await new Promise((r) => setTimeout(r, 300));
+    const logs = scopeStderr();
+    const s19 = assert(logs.includes('dropped dm- channel "dm-x"') && logs.includes('wildcard "team-*"') && logs.includes('[SCOPE] out_of_scope key=host-b route=GET /api/messages/dm-x'), 'L1. dm-x and wildcard dropped from scope env; out_of_scope logged');
+    passed += s19.passed ? 1 : 0;
+    failed += s19.passed ? 0 : 1;
+    const s20 = assert(logs.includes('[SCOPE] rate_limited key=host-b') && logs.includes('[SCOPE] payload_too_large key=host-b') && logs.includes('[SCOPE] ALARM key=host-b'), 'L2. 429 and 413 logged with [SCOPE] format; ALARM emitted at 5+ refusals');
+    passed += s20.passed ? 1 : 0;
+    failed += s20.passed ? 0 : 1;
+
+    await stopServer(serverProc);
+    serverProc = null;
 
     // Final cleanup
     await stopServer(serverProc);

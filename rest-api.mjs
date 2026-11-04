@@ -12,6 +12,24 @@ import { Router } from "express";
 import { STALE_THRESHOLD_SECONDS } from "./tools.mjs";
 import { normalizeChannelName } from "./db.mjs";
 import { messageEvents } from "./message-events.mjs";
+import { scopeRefuse, scopeSendAllowed, nameBound, SCOPE_CONTENT_MAX } from "./scope-guard.mjs";
+
+// Gate 6: scoped (teammate) keys. server.mjs sets req.scope to {channels: Set, prefix} or null when unscoped.
+// Fail closed: a scoped key reaches only the routes below; every other route is 403.
+const SCOPED_ROUTES = [
+  ["POST", /^\/register$/],
+  ["POST", /^\/messages$/],
+  ["GET", /^\/messages\/[^/]+$/],
+  ["GET", /^\/messages\/[^/]+\/[^/]+\/replies$/],
+  ["GET", /^\/stream$/],
+  ["GET", /^\/channels$/],
+  ["GET", /^\/channels\/search$/],
+  ["GET", /^\/search$/],
+  ["GET", /^\/instances$/],
+];
+const inScope = (req, channel) => !req.scope || req.scope.channels.has(channel);
+const filterScope = (req, rows, field) => (req.scope ? rows.filter((row) => req.scope.channels.has(row[field])) : rows);
+const denyScope = (req, res) => scopeRefuse(req, res, "out_of_scope", 403);
 
 /**
  * @param {object} db - Database instance (SqliteDB or PostgresDB)
@@ -19,6 +37,11 @@ import { messageEvents } from "./message-events.mjs";
  */
 export function createRestRouter(db) {
   const router = Router();
+  router.use((req, res, next) => {
+    if (!req.scope) return next();
+    if (SCOPED_ROUTES.some(([method, re]) => method === req.method && re.test(req.path))) return next();
+    return denyScope(req, res);
+  });
   router.use((req, res, next) => {
     // express.json() should already be applied, but ensure it
     if (req.is("application/json") && !req.body) {
@@ -33,6 +56,7 @@ export function createRestRouter(db) {
     try {
       const { instance_id, description } = req.body;
       if (!instance_id) return res.status(400).json({ error: "instance_id is required" });
+      if (req.scope && !nameBound(req.scope, instance_id)) return denyScope(req, res);
       await db.registerInstance(instance_id, description || null, null);
       res.json({ ok: true, instance_id });
     } catch (e) { next(e); }
@@ -41,7 +65,7 @@ export function createRestRouter(db) {
   router.get("/instances", async (req, res, next) => {
     try {
       await db.markStaleOffline(STALE_THRESHOLD_SECONDS);
-      const instances = await db.listInstances();
+      const instances = req.scope ? await db.listInstancesPostedIn([...req.scope.channels]) : await db.listInstances();
       res.json({ instances });
     } catch (e) { next(e); }
   });
@@ -61,7 +85,7 @@ export function createRestRouter(db) {
 
   router.get("/channels", async (req, res, next) => {
     try {
-      const channels = await db.listChannelsWithActivity();
+      const channels = filterScope(req, await db.listChannelsWithActivity(), "name");
       res.json({ channels });
     } catch (e) { next(e); }
   });
@@ -70,7 +94,7 @@ export function createRestRouter(db) {
     try {
       const { q } = req.query;
       if (!q) return res.status(400).json({ error: "q (query) parameter is required" });
-      const channels = await db.findChannels(q);
+      const channels = filterScope(req, await db.findChannels(q), "name");
       res.json({ channels });
     } catch (e) { next(e); }
   });
@@ -88,6 +112,12 @@ export function createRestRouter(db) {
       }
       const normalized = normalizeChannelName(channel);
       if (!normalized) return res.status(400).json({ error: `Invalid channel name "${channel}"` });
+      if (!inScope(req, normalized)) return denyScope(req, res);
+      if (req.scope) {
+        if (!nameBound(req.scope, sender)) return denyScope(req, res);
+        if (Buffer.byteLength(String(content)) > SCOPE_CONTENT_MAX) return scopeRefuse(req, res, "payload_too_large", 413);
+        if (!scopeSendAllowed(req.keyId)) return scopeRefuse(req, res, "rate_limited", 429);
+      }
       // Auto-create channel if it doesn't exist
       await db.createChannel(normalized, null);
       const id = await db.sendMessage(normalized, sender, content, message_type, in_reply_to || null);
@@ -98,6 +128,7 @@ export function createRestRouter(db) {
   router.get("/messages/:channel", async (req, res, next) => {
     try {
       const { channel } = req.params;
+      if (!inScope(req, channel)) return denyScope(req, res);
       const after_id = req.query.after_id ? parseInt(req.query.after_id) : undefined;
       const instance_id = req.query.instance_id;
       const limit = parseInt(req.query.limit) || 20;
@@ -120,7 +151,9 @@ export function createRestRouter(db) {
   router.get("/messages/:channel/:id/replies", async (req, res, next) => {
     try {
       const id = parseInt(req.params.id);
+      if (!inScope(req, req.params.channel)) return denyScope(req, res);
       const parent = await db.getMessage(id);
+      if (req.scope && (!parent || !inScope(req, parent.channel))) return denyScope(req, res);
       if (!parent) return res.status(404).json({ error: `Message #${id} not found` });
       const replies = await db.getReplies(id);
       res.json({ parent, replies });
@@ -132,7 +165,7 @@ export function createRestRouter(db) {
       const { q } = req.query;
       if (!q) return res.status(400).json({ error: "q (query) parameter is required" });
       const limit = parseInt(req.query.limit) || 10;
-      const messages = await db.searchMessages(q, limit);
+      const messages = filterScope(req, await db.searchMessages(q, limit), "channel");
       res.json({ messages });
     } catch (e) { next(e); }
   });
@@ -175,6 +208,7 @@ export function createRestRouter(db) {
         .map((c) => normalizeChannelName(c.trim())).filter(Boolean);
       if (channels.length === 0) return res.status(400).json({ error: "channels query parameter is required (comma-separated)" });
       if (channels.length > 20) return res.status(400).json({ error: "at most 20 channels per stream" });
+      if (channels.some((c) => !inScope(req, c))) return denyScope(req, res);
       let afterId;
       if (req.query.after_id !== undefined && req.query.after_id !== "") {
         afterId = parseInt(req.query.after_id, 10);

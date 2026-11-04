@@ -16,11 +16,12 @@
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { createDB } from "./db.mjs";
+import { createDB, normalizeChannelName } from "./db.mjs";
 import { registerTools } from "./tools.mjs";
 import { createRestRouter } from "./rest-api.mjs";
 import { InviteCodeOAuthProvider, createAuthorizeSubmitHandler } from "./auth.mjs";
 import { requestContext } from "./request-context.mjs";
+import { scopeRefuse } from "./scope-guard.mjs";
 import { createHash, timingSafeEqual } from "crypto";
 
 // Parses CROSS_CLAUDE_KEYS (raw JSON object, or base64 of one) into [id, sha256 digest] pairs.
@@ -51,6 +52,59 @@ function loadKeyEntries(raw) {
     }
   }
   return entries;
+}
+
+// Parses CROSS_CLAUDE_SCOPES (raw JSON object, or base64 of one) into Map<keyId, {channels: Set, prefix}> (Gate 6).
+// Value: ["team-syb", ...] (no register or send allowed) or {"channels": [...], "instance_prefix": "vicky"}.
+// Channel names are exact (no wildcards). dm-* channels are dropped. Malformed input logs and yields an empty map; never throws.
+function loadKeyScopes(raw) {
+  if (!raw) return new Map();
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    try {
+      parsed = JSON.parse(Buffer.from(raw, "base64").toString("utf-8"));
+    } catch {
+      console.error("[SCOPE] CROSS_CLAUDE_SCOPES is neither JSON nor base64 JSON; treated as empty");
+      return new Map();
+    }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    console.error("[SCOPE] CROSS_CLAUDE_SCOPES must be a JSON object; treated as empty");
+    return new Map();
+  }
+  const scopes = new Map();
+  for (const [id, entry] of Object.entries(parsed)) {
+    const isArray = Array.isArray(entry);
+    const list = isArray ? entry : entry && typeof entry === "object" ? entry.channels : null;
+    if (!Array.isArray(list) || !list.every((c) => typeof c === "string")) {
+      console.error(`[SCOPE] CROSS_CLAUDE_SCOPES entry "${id}" must be an array of channel names or {channels, instance_prefix}; skipped`);
+      continue;
+    }
+    let prefix = null;
+    if (!isArray && entry.instance_prefix !== undefined) {
+      if (typeof entry.instance_prefix === "string" && /^[a-z0-9]+(-[a-z0-9]+)*$/.test(entry.instance_prefix)) {
+        prefix = entry.instance_prefix;
+      } else {
+        console.error(`[SCOPE] instance_prefix for key "${id}" must be lowercase letters, digits and dashes; name binding disabled`);
+      }
+    }
+    const channels = new Set();
+    for (const name of list) {
+      if (name.includes("*")) {
+        console.error(`[SCOPE] wildcard "${name}" in scope of key "${id}" rejected; scopes take exact names`);
+      } else if (normalizeChannelName(name) === null) {
+        console.error(`[SCOPE] invalid channel "${name}" in scope of key "${id}"; dropped`);
+      } else if (normalizeChannelName(name).startsWith("dm-")) {
+        console.error(`[SCOPE] dropped dm- channel "${name}" from scope of key "${id}"`);
+      } else {
+        channels.add(normalizeChannelName(name));
+      }
+    }
+    scopes.set(id, { channels, prefix });
+  }
+  return scopes;
 }
 
 // --- Transport: Stdio (local) ---
@@ -187,6 +241,9 @@ li{margin:4px 0}</style></head>
 
   const API_TOKEN = process.env.MCP_API_KEY;
   const idDigests = loadKeyEntries(process.env.CROSS_CLAUDE_KEYS || "");
+  const keyScopes = loadKeyScopes(process.env.CROSS_CLAUDE_SCOPES || "");
+  // Scope for an identity key, or null when unscoped (R's identities, legacy, oauth).
+  const scopeFor = (keyId) => (keyScopes.has(keyId) ? keyScopes.get(keyId) : null);
   const legacyDigest = API_TOKEN ? createHash("sha256").update(API_TOKEN).digest() : null;
   const devOpen = !API_TOKEN && !process.env.CROSS_CLAUDE_KEYS && process.env.CROSS_CLAUDE_DEV === "1";
   const killed = process.env.CROSS_CLAUDE_KILL === "1";
@@ -211,8 +268,9 @@ li{margin:4px 0}</style></head>
       : (typeof req.query.api_key === "string" ? req.query.api_key : null);
 
     // Admit with an identity: req.keyId + AsyncLocalStorage so db.sendMessage stamps sender_key_id.
-    const admit = (kid, how) => {
+    const admit = (kid, how, scope = null) => {
       req.keyId = kid;
+      req.scope = scope;
       console.log(`[AUTH OK] ${req.method} ${req.path} (${how})`);
       return requestContext.run({ keyId: kid }, () => next());
     };
@@ -224,7 +282,7 @@ li{margin:4px 0}</style></head>
       for (const [id, ref] of idDigests) {
         if (timingSafeEqual(d, ref)) hit = id;
       }
-      if (hit !== null) return admit(hit, `key:${hit}`);
+      if (hit !== null) return admit(hit, `key:${hit}`, scopeFor(hit));
       if (legacyDigest && timingSafeEqual(d, legacyDigest)) return admit("legacy", "key:legacy");
     }
 
@@ -246,6 +304,12 @@ li{margin:4px 0}</style></head>
   app.use(["/api", "/mcp", "/sse", "/messages"], (req, res, next) => {
     if (killed) return res.status(503).json({ error: "killed" });
     next();
+  });
+
+  // Gate 6: scoped (teammate) keys never reach the MCP/SSE transports or the legacy root /messages endpoint.
+  app.use(["/mcp", "/sse", "/messages"], (req, res, next) => {
+    if (!req.scope) return next();
+    return scopeRefuse(req, res, "out_of_scope", 403);
   });
 
   // --- REST API (for ChatGPT, Gemini, curl, etc.) ---
