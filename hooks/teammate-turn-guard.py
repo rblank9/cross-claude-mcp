@@ -5,6 +5,11 @@ Denies dangerous tool calls while the session is TAINTED. Taint is set by a
 channel/peer message whose header is not a verified key in trusted_keys.json,
 and it is sticky: only a later human-typed entry clears it.
 
+ACCEPTED RESIDUAL: deeper obfuscation (base64 piped into a python exec, a script
+written to disk and then run) is not closable by a static command matcher. security-guard
+accepted this residual on 2026-11-03. Do not add patterns chasing it; close it with a
+tool-level policy instead.
+
 Helpers marked "copied from autopilot.py" mirror
 /Users/rblank/Projects/claude-optimization/hooks/lib/autopilot.py and are
 copied, not imported, so this repo stays standalone.
@@ -33,6 +38,11 @@ POST_RE = re.compile(
     r"|--method[= ]+POST|\bPOST\b|(?<!\S)(?:-d|--data[\w-]*|--json)(?=\s|=|$)|\bdata\s*=",
     re.I,
 )
+CLAUDE_INBOX_RE = re.compile(r"(?<![\w.-])claude-inbox(?![\w.-])")
+CLAUDE_CODE_PKG = "@anthropic-ai/claude-code"
+PIPE_SHELL_RE = re.compile(r"\|&?\s*(?:[^\s|;&]*/)?(?:sh|bash|zsh|dash)(?=\s|$|;|&|\))")
+SUBST_RE = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
+SUBST_LAUNCH_RE = re.compile(r"\b(?:which|command\s+-v|type\s+-p)\b[^\n]*\b(?:claude|ccx|cc2|ccm|ccc)\b")
 URL_RE = re.compile(r"inbox|cross-claude|crosswi\.re|/api/messages|railway\.app", re.I)
 
 BASH_DENY = [
@@ -222,7 +232,7 @@ def trusted_message(text, trusted):
     """True only if every top-level envelope (outside body blocks) has a verified header
     whose key is a string entry in trusted_keys, and there is at least one envelope.
     Text inside a body block is never a header."""
-    lines = [ln.rstrip() for ln in text.splitlines()]
+    lines = [ln.strip() for ln in text.splitlines()]
     envelopes = 0
     in_body = None
     for i, line in enumerate(lines):
@@ -263,8 +273,10 @@ def bridge_sourced(entry):
     if kind == "channel":
         return origin.get("server") == "cross-claude-bridge"
     if kind == "peer":
-        text = message_text(entry)
-        return "CROSS-CLAUDE-BODY" in text or "cross-claude-bridge" in text
+        # Courier traffic = a real envelope delimiter line. Prose that merely names the bridge
+        # or the marker inline is not courier traffic; a real delimiter with a bad header still
+        # taints via trusted_message (fail closed).
+        return any(BODY_OPEN_RE.match(ln.strip()) for ln in message_text(entry).splitlines())
     return False
 
 
@@ -366,8 +378,32 @@ def relay_denial(cmd):
             return "claude/ccx/cc2/ccm/ccc invocation"
         if word in RELAY_WORDS:
             return "inbox relay"
+    if CLAUDE_INBOX_RE.search(cmd):
+        return "inbox relay (claude-inbox path)"
     if any(w in NET_WORDS for w, _t, _s in hits) and URL_RE.search(cmd) and POST_RE.search(cmd):
         return "POST to a relay endpoint"
+    return None
+
+
+def subst_denial(cmd, depth=0):
+    """Command substitution ($(...) or backticks): a which/command -v/type -p lookup of a claude
+    launcher is a launch; the substituted content is also checked as its own command."""
+    if depth > 8:
+        return None
+    for m in SUBST_RE.finditer(cmd):
+        inner = m.group(1) if m.group(1) is not None else (m.group(2) or "")
+        if SUBST_LAUNCH_RE.search(inner):
+            return "command substitution resolving a claude launch"
+        rule = relay_denial(inner) or subst_denial(inner, depth + 1)
+        if rule:
+            return rule
+    return None
+
+
+def pkg_denial(cmd):
+    """Any token naming the claude-code npm package (npx, bunx, pnpm dlx, yarn dlx, ...)."""
+    if CLAUDE_CODE_PKG in cmd:
+        return "npx/bunx/dlx @anthropic-ai/claude-code launch"
     return None
 
 
@@ -381,9 +417,11 @@ def denial(tool, tin):
         for pattern, label in BASH_DENY:
             if re.search(pattern, cmd):
                 return label
-        rule = relay_denial(cmd)
+        rule = relay_denial(cmd) or subst_denial(cmd) or pkg_denial(cmd)
         if rule:
             return rule
+        if PIPE_SHELL_RE.search(cmd):
+            return "pipe into a shell"
         if re.search(BASH_SECRET_READ, cmd):
             return "secret file read"
         if any(t in cmd for t in WRITE_TARGETS) and WRITE_OP_RE.search(cmd):
