@@ -13,6 +13,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 
@@ -23,6 +24,16 @@ SESSION_ID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
 BODY_OPEN_RE = re.compile(r"^<<<CROSS-CLAUDE-BODY ([0-9a-f]{8})$")
 VERIFIED_HEADER_RE = re.compile(r"^\[#[^\]]+\] message from \S+ \(verified key (\S+)\):$")
 DAEMON_MARKERS = ("--bg-spare", " bg-spare", "--bg-pty-host", " daemon run")
+SPAWN_WORDS = {"claude", "ccx", "cc2", "ccm", "ccc"}
+RELAY_WORDS = {"inbox", "claude-inbox"}
+NET_WORDS = {"curl", "wget", "http", "https", "httpie", "python", "python3", "node"}
+SHELL_WORDS = {"bash", "sh", "zsh", "dash"}
+POST_RE = re.compile(
+    r"\.post\(|method\s*[:=]\s*['\"]?post\b|-X\s*POST|-XPOST|--request\s+POST|--post-data|--post-file"
+    r"|--method[= ]+POST|\bPOST\b|(?<!\S)(?:-d|--data[\w-]*|--json)(?=\s|=|$)|\bdata\s*=",
+    re.I,
+)
+URL_RE = re.compile(r"inbox|cross-claude|crosswi\.re|/api/messages|railway\.app", re.I)
 
 BASH_DENY = [
     (r"\b(op|with-env|secret-provision|spawn-collaborator|cc-bridge-keys)\b", "credential/spawn tool"),
@@ -257,12 +268,107 @@ def bridge_sourced(entry):
     return False
 
 
+def state_dir():
+    return os.environ.get("CROSS_CLAUDE_STATE_DIR") or os.path.expanduser("~/.local/state/cross-claude")
+
+
 def team_listening(session_id):
     if os.environ.get(ENV_LISTENING) == "1":
         return True
+    marker_dir = os.path.join(state_dir(), "team-listening")
     if isinstance(session_id, str) and SESSION_ID_RE.match(session_id):
-        return os.path.exists(os.path.expanduser(f"~/.local/state/cross-claude/team-listening/{session_id}"))
-    return False
+        return os.path.exists(os.path.join(marker_dir, session_id))
+    # No usable session id (unreadable input): fail closed if any session is team-listening.
+    try:
+        return len(os.listdir(marker_dir)) > 0
+    except OSError:
+        return False
+
+
+# --- command-word scanning (wrappers stripped, shell -c and eval recursed) ---
+
+def split_segments(cmd):
+    return [s for s in re.split(r"&&|\|\||[;|&\n]", cmd) if s.strip()]
+
+
+def argv_of(seg):
+    try:
+        toks = shlex.split(seg, posix=True)
+    except ValueError:
+        toks = seg.split()
+    while toks and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0]):
+        toks = toks[1:]
+    return toks
+
+
+def _skip_opts(toks):
+    while toks and toks[0].startswith("-"):
+        toks = toks[1:]
+    return toks
+
+
+def _skip_env(toks):
+    while toks and (toks[0].startswith("-") or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0])):
+        toks = toks[2:] if toks[0] in ("-u", "-C", "-S") else toks[1:]
+    return toks
+
+
+def _c_payload(toks):
+    """(payload, rest) for a short-option bundle containing c (sh -c, script -qc), else (None, toks)."""
+    for i, t in enumerate(toks):
+        if t.startswith("--") or not t.startswith("-"):
+            break
+        if "c" in t[1:]:
+            return (toks[i + 1] if i + 1 < len(toks) else None), toks[i + 2:]
+    return None, toks
+
+
+def scan(cmd, depth=0):
+    """Yield (command_word, argv, segment) for every command in cmd. Command word is the basename of
+    the first word after VAR=val prefixes and wrappers (nohup, xargs, command, exec, env, timeout, script)."""
+    if depth > 8:
+        return
+    for seg in split_segments(cmd):
+        toks = argv_of(seg)
+        while toks:
+            word = os.path.basename(toks[0])
+            rest = toks[1:]
+            if word == "eval":
+                yield from scan(" ".join(rest), depth + 1)
+                break
+            if word in SHELL_WORDS:
+                yield (word, toks, seg)
+                payload, _ = _c_payload(rest)
+                if payload is not None:
+                    yield from scan(payload, depth + 1)
+                break
+            if word in ("nohup", "xargs", "command", "exec", "builtin"):
+                toks = _skip_opts(rest)
+            elif word == "env":
+                toks = _skip_env(rest)
+            elif word == "timeout":
+                toks = _skip_opts(rest)[1:]
+            elif word == "script":
+                payload, rest2 = _c_payload(rest)
+                if payload is not None:
+                    yield from scan(payload, depth + 1)
+                    break
+                toks = _skip_opts(rest2)[1:]  # typescript file, e.g. /dev/null
+            else:
+                yield (word, toks, seg)
+                break
+
+
+def relay_denial(cmd):
+    hits = list(scan(cmd))
+    for word, _toks, _seg in hits:
+        if word in SPAWN_WORDS:
+            return "claude/ccx/cc2/ccm/ccc invocation"
+        if word in RELAY_WORDS:
+            return "inbox relay"
+    if any(w in NET_WORDS for w, _t, _s in hits) and URL_RE.search(cmd) and POST_RE.search(cmd):
+        return "POST to a relay endpoint"
+    return None
 
 
 # --- denial rules -----------------------------------------------------------
@@ -275,6 +381,9 @@ def denial(tool, tin):
         for pattern, label in BASH_DENY:
             if re.search(pattern, cmd):
                 return label
+        rule = relay_denial(cmd)
+        if rule:
+            return rule
         if re.search(BASH_SECRET_READ, cmd):
             return "secret file read"
         if any(t in cmd for t in WRITE_TARGETS) and WRITE_OP_RE.search(cmd):
@@ -317,7 +426,10 @@ def main():
     try:
         payload = json.loads(sys.stdin.read())
     except ValueError:
-        sys.stderr.write("teammate-turn-guard: unreadable hook input; allowing\n")
+        if team_listening(None):
+            emit_deny("unreadable hook input while team-listening")
+            return 0
+        sys.stderr.write("teammate-turn-guard: unreadable hook input; allowing, session not team-listening\n")
         return 0
     if not isinstance(payload, dict):
         return 0

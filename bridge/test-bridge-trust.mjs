@@ -6,12 +6,14 @@
 import { spawn, spawnSync } from "child_process";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, unlinkSync } from "fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync } from "fs";
 import { tmpdir } from "os";
 import crypto from "crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { signEnvelope, parseEnvelope, canonical, sha8, REASONS } from "./trust.mjs";
+import { signEnvelope, parseEnvelope, canonical, sha8, REASONS, loadTrusted, verifyEnvelope, createNonceStore, teamDenyReason, setTeamMarker, teamMarkerPath, recordDrop, teamChannelsOf } from "./trust.mjs";
+import { deliveryHeader } from "./cross-claude-bridge.mjs";
+import { statSync } from "fs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO = join(__dirname, "..");
@@ -333,7 +335,7 @@ async function runTests() {
   console.log("13. audit contract");
   const lines = auditLines();
   const bad13 = lines.filter((l) =>
-    l.__unparseable !== undefined || l.v !== 1 || typeof l.host !== "string" ||
+    l.__unparseable !== undefined || l.v !== 2 || typeof l.host !== "string" ||
     !("identity" in l) || !/^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/.test(String(l.ts)) ||
     (l.reason !== undefined && !REASONS.includes(l.reason))
   );
@@ -368,12 +370,86 @@ async function runTests() {
   await stopProc(noKeys);
 }
 
+// ---- Gate 7 teammate scope (unit level: pure trust.mjs functions and the exported header) ----
+async function runTeammateUnit() {
+  console.log("0. teammate scope (gate 7, unit)");
+  const U = mkdtempSync(join(tmpdir(), "bridge-tm-unit-"));
+  const env = { PATH: process.env.PATH, HOME: U, CROSS_CLAUDE_CONFIG_DIR: join(U, "cfg"), CROSS_CLAUDE_STATE_DIR: join(U, "state") };
+  try {
+    const mk = () => {
+      const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
+      return {
+        pem: privateKey.export({ type: "pkcs8", format: "pem" }),
+        pub: publicKey.export({ type: "spki", format: "der" }).toString("base64"),
+      };
+    };
+    const TM = mk();
+    const FULL = mk();
+    const BAD = mk();
+    const UNK = mk();
+    const trustedFile = { "tm-alpha": { pub: TM.pub, tier: "teammate", channels: ["team-syb"] }, "full-alpha": FULL.pub, "tm-bad": { pub: BAD.pub, tier: "teammate", channels: ["dm-x", "a*"] }, "tm-unk": { pub: UNK.pub, tier: "guest", channels: ["team-syb"] } };
+    mkdirSync(join(U, "cfg"), { recursive: true });
+    writeFileSync(join(U, "cfg", "trusted_keys.json"), JSON.stringify(trustedFile));
+    const trusted = loadTrusted(env, U);
+    const store = createNonceStore(env, U);
+    const verify = (pem, from, ch, body) => verifyEnvelope(signEnvelope({ from_key: from, from_instance: "inst", channel: ch, body }, pem), { channel: ch, trusted, nonceStore: store });
+
+    const r1 = verify(TM.pem, "tm-alpha", "team-syb", "in-scope");
+    check(r1.ok && r1.tier === "teammate", "teammate in-scope channel: delivered, tier teammate");
+    const r2 = verify(TM.pem, "tm-alpha", "team-other", "other");
+    check(!r2.ok && r2.reason === "out_of_scope", "teammate other channel: out_of_scope");
+    const r3 = verify(TM.pem, "tm-alpha", "dm-tm", "dm");
+    check(!r3.ok && r3.reason === "out_of_scope", "teammate dm-* channel: out_of_scope");
+    const r4 = ["team-syb", "dm-rcv", "other"].map((ch) => verify(FULL.pem, "full-alpha", ch, "full"));
+    check(r4.every((r) => r.ok && r.tier === "full"), "string entry: still full trust on every channel");
+    const r5 = verify(BAD.pem, "tm-bad", "team-syb", "bad");
+    check(!r5.ok && r5.reason === "unknown_key", "malformed object entry (no valid channels): unknown_key");
+    const r6 = verify(UNK.pem, "tm-unk", "team-syb", "unk");
+    check(!r6.ok && r6.reason === "unknown_key", "object entry with unknown tier: unknown_key");
+
+    const teamHdr = deliveryHeader("team-syb", "inst", "tm-alpha", "teammate");
+    check(teamHdr.includes("TEAMMATE") && !teamHdr.includes("(verified key"), "teammate header contains TEAMMATE and not (verified key");
+    const fullHdr = deliveryHeader("c", "i", "k", "full");
+    check(fullHdr === "[#c] message from i (verified key k):\n", "full-trust header byte-identical to the original");
+
+    recordDrop("out_of_scope", { identity: "t", sha8: "x" }, env, U);
+    const line = readFileSync(join(U, "state", "audit.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l)).pop();
+    check(line.v === 2 && line.reason === "out_of_scope", "audit line is v:2 and carries reason out_of_scope");
+
+    check(teamDenyReason("/x/security-guard", {}) === "team_denied", "deny list by cwd basename (security-guard): team_denied");
+    check(teamDenyReason("/x/claude-optimization", {}) === "team_denied", "deny list by cwd basename (claude-optimization): team_denied");
+    check(teamDenyReason("/x/project", {}) === null, "ordinary cwd with no env token: allowed");
+    check(teamDenyReason("/x/project", { OP_SERVICE_ACCOUNT_TOKEN: "t" }) === "team_denied", "deny list by env (OP_SERVICE_ACCOUNT_TOKEN present): team_denied");
+    check(teamDenyReason("/x/project", { OP_SERVICE_ACCOUNT_TOKEN: "" }) === null, "empty OP_SERVICE_ACCOUNT_TOKEN does not deny");
+    check(teamChannelsOf(trusted).has("team-syb") && !teamChannelsOf(trusted).has("dm-x"), "team channel set = teammate channels only");
+
+    // Marker: HOME override only (no state dir env), mode 0600, removed on off.
+    const homeOnly = { PATH: process.env.PATH };
+    setTeamMarker("sess-1", true, homeOnly, U);
+    const mp = teamMarkerPath("sess-1", homeOnly, U);
+    check(existsSync(mp) && (statSync(mp).mode & 0o777) === 0o600 && mp.startsWith(join(U, ".local", "state", "cross-claude", "team-listening")), "team-listening marker created under temp HOME, mode 0600");
+    setTeamMarker("sess-1", false, homeOnly, U);
+    check(!existsSync(mp), "team-listening marker removed on last team unlisten");
+
+    // cc-bridge-keys trust --teammate
+    const tmCli = (args) => spawnSync(process.execPath, [KEYS_CLI, ...args], { env, encoding: "utf8" });
+    const refuse = tmCli(["trust", "tm-x", TM.pub, "--teammate", "--channels", "dm-x"]);
+    const notWritten = !readFileSync(join(U, "cfg", "trusted_keys.json"), "utf8").includes("tm-x");
+    check(refuse.status !== 0 && notWritten, "cc-bridge-keys trust --teammate refuses dm-x and writes nothing");
+    const okCli = tmCli(["trust", "tm-y", TM.pub, "--teammate", "--channels", "team-syb"]);
+    check(okCli.status === 0 && loadTrusted(env, U)["tm-y"]?.tier === "teammate", "cc-bridge-keys trust --teammate team-syb writes the object form");
+  } finally {
+    rmSync(U, { recursive: true, force: true });
+  }
+}
+
 const guard = setTimeout(() => {
   console.log("FAIL: overall 240 s guard hit");
   process.exit(1);
 }, 240000);
 
 try {
+  await runTeammateUnit();
   await runTests();
 } catch (err) {
   failed++;

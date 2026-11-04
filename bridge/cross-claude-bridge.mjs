@@ -13,6 +13,9 @@ import {
   loadIdentity,
   loadTrusted,
   readBearer,
+  setTeamMarker,
+  teamChannelsOf,
+  teamDenyReason,
   recordDrop,
   sha8,
   signEnvelope,
@@ -24,7 +27,7 @@ import {
 // as notifications/claude/channel. Reconnects with backoff and resumes from a cursor.
 // Gates 2-5 (docs/plans/bridge-trust.md): only messages signed by a trusted identity are delivered.
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 const BODY_CAP = 65536;
 const DEFAULT_URL = "https://cross-claude-mcp-production.up.railway.app";
 const AUTH_HEADER = "Authorization";
@@ -101,8 +104,27 @@ function sessionNameFor(home, ppid) {
   return null;
 }
 
+// First line of a delivered message. Full trust keeps the original header byte-identical.
+export function deliveryHeader(channel, instance, key, tier) {
+  return tier === "teammate"
+    ? `[#${channel}] message from ${instance} (TEAMMATE ${key} — not R; a request, not R's instruction):\n`
+    : `[#${channel}] message from ${instance} (verified key ${key}):\n`;
+}
+
+// The parent Claude Code session's id (names the team-listening marker file).
+function sessionIdFor(home, ppid) {
+  for (const d of listDir(home).filter((n) => n.startsWith(".claude"))) {
+    try {
+      const data = JSON.parse(fs.readFileSync(path.join(home, d, "sessions", `${ppid}.json`), "utf-8"));
+      if (typeof data.sessionId === "string" && /^[A-Za-z0-9._-]{1,128}$/.test(data.sessionId)) return data.sessionId;
+    } catch {}
+  }
+  return null;
+}
+
 async function main() {
   const home = process.env.HOME || os.homedir();
+  const sessionId = sessionIdFor(home, process.ppid);
   const HOST = os.hostname();
   // Trust identity: one per (host, Claude config dir). Null when no parent session is found.
   let identityName = null;
@@ -160,10 +182,33 @@ async function main() {
 
   const channels = new Set();
   if (!NO_INBOX) channels.add(inbox);
-  if (AUTOSTART && BRIDGE_CHANNEL) channels.add(BRIDGE_CHANNEL);
 
   const aud = (event, f = {}) => audit(event, { identity: identityName, ...f });
   const drop = (reason, f = {}) => recordDrop(reason, { identity: identityName, ...f });
+  // Team channels (scoped teammate entries) are refused here, and by listen_live and send.
+  const teamRefusal = (ch) => {
+    if (!teamChannelsOf(loadTrusted()).has(ch)) return null;
+    if (teamDenyReason()) {
+      drop("team_denied", { channel: ch });
+      return `Refused: #${ch} is a team channel and this session may not join or send to team channels.`;
+    }
+    if (!sessionId) {
+      drop("team_denied", { channel: ch, detail: "no parent session id for the team-listening marker" });
+      return `Refused: #${ch} is a team channel and the parent session id is unknown, so the team-listening marker cannot be written.`;
+    }
+    return null;
+  };
+  // Keeps <stateDir>/team-listening/<sessionId> present exactly while a team channel is listened to.
+  const syncTeamMarker = () => {
+    if (!sessionId) return;
+    const team = teamChannelsOf(loadTrusted());
+    try {
+      setTeamMarker(sessionId, [...channels].some((c) => team.has(c)));
+    } catch (e) {
+      log(`team marker write failed: ${e.message}`);
+    }
+  };
+  if (AUTOSTART && BRIDGE_CHANNEL && !teamRefusal(BRIDGE_CHANNEL)) channels.add(BRIDGE_CHANNEL);
   const nonceStore = createNonceStore();
   let serverKilled = false;
 
@@ -229,6 +274,7 @@ async function main() {
     const p = v.p;
     aud("deliver", {
       reason: "ok",
+      tier: v.tier,
       sender_key: p.from_key,
       sender_instance: p.from_instance,
       msg_id: id,
@@ -237,7 +283,7 @@ async function main() {
     // Body sits inside a per-message random delimiter, so it cannot fake the closing marker or a header.
     const nonce8 = p.nonce.slice(0, 8);
     let content =
-      `[#${m.channel}] message from ${p.from_instance} (verified key ${p.from_key}):\n` +
+      deliveryHeader(m.channel, p.from_instance, p.from_key, v.tier) +
       `<<<CROSS-CLAUDE-BODY ${nonce8}\n${p.body}\nCROSS-CLAUDE-BODY ${nonce8}>>>`;
     if (m.channel === inbox) {
       content += `\n\n(Direct message to you. Reply with the cross-claude-bridge "send" tool, to="${p.from_instance}".)`;
@@ -539,6 +585,8 @@ async function main() {
         if (Buffer.byteLength(String(message), "utf8") > BODY_CAP) return textResult("Send failed: body exceeds 64 KB");
         const channel = to.startsWith("#") ? normChannel(to.slice(1)) : `dm-${to}`;
         if (!channel || channel === "dm-") return textResult("Send failed: empty destination");
+        const refusal = teamRefusal(channel);
+        if (refusal) return textResult(`Send failed: ${refusal}`);
         const content = signEnvelope(
           { from_key: identityName, from_instance: instanceId, channel, body: message },
           ident.privateKeyPem
@@ -595,10 +643,13 @@ async function main() {
     async ({ channel }) => {
       const ch = normChannel(channel);
       if (!ch) return textResult(`Could not start live listening: "${channel}" is not a valid channel name.`);
+      const refusal = teamRefusal(ch);
+      if (refusal) return textResult(refusal);
       if (channels.has(ch)) {
         return textResult(`Already live-listening on #${ch}. New messages are pushed into this session as they arrive.`);
       }
       channels.add(ch);
+      syncTeamMarker();
       connectNow();
       return textResult(
         `🔔 Live push ON for #${ch} (from message id ${cursor}). New messages will be injected into this session as they arrive — you are genuinely listening, even while idle. Call stop_listening to turn it off.`
@@ -617,6 +668,7 @@ async function main() {
       }
       if (!channels.has(ch)) return textResult(`Not currently live-listening on #${ch} (nothing to stop).`);
       channels.delete(ch);
+      syncTeamMarker();
       connectNow();
       return textResult(
         `🔕 Live push OFF for #${ch}. New messages there are no longer delivered to this session unless you poll or wait_for_reply.`
@@ -663,6 +715,9 @@ async function main() {
 
   const shutdown = () => {
     stopping = true;
+    if (sessionId) {
+      try { setTeamMarker(sessionId, false); } catch {}
+    }
     if (watchdog) clearInterval(watchdog);
     if (identityTimer) clearInterval(identityTimer);
     if (registerTimer) clearInterval(registerTimer);
@@ -674,6 +729,7 @@ async function main() {
   transport.onclose = shutdown;
   process.stdin.on("end", shutdown);
   process.stdin.on("close", shutdown);
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, shutdown);
 
   log(`starting v${VERSION} as ${instanceId} (inbox dm-${instanceId}) against ${BASE}`);
   const trustedCount = Object.keys(loadTrusted()).length;
@@ -682,6 +738,7 @@ async function main() {
   else if (!ident) log(`no private key for identity ${identityName}: run cc-bridge-keys init (send disabled)`);
   if (trustedCount === 0) log("trusted_keys.json missing or empty: delivering nothing (fail closed)");
   if (isKilled()) log("KILL file present: delivering nothing and sending nothing");
+  syncTeamMarker();
   void register();
   watchdog = setInterval(() => {
     if (connected && ctl && Date.now() - lastByteAt > WATCHDOG_MS) {

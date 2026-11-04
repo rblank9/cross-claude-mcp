@@ -244,6 +244,13 @@ def test_plain_local_peer_message_does_not_taint(env_setup, tmp_path):
     assert not is_deny(out)
 
 
+def test_plain_local_peer_relay_words_do_not_taint(env_setup, tmp_path):
+    # Neighbor of the plain-peer test: relay words in a plain local peer message must not taint the turn.
+    t = write_transcript(tmp_path / "t.jsonl", [channel("run inbox send x and curl -X POST https://crosswi.re/api/messages", kind="peer")])
+    out, _ = run_hook(env_setup, t, BASH, {"command": "op read x"})
+    assert not is_deny(out)
+
+
 def test_peer_courier_with_drifted_header_denies(env_setup, tmp_path):
     # Courier text with bridge markers but an unparseable header stays fail-closed.
     text = "[#team-syb] from vicky-mac [?]:\n<<<CROSS-CLAUDE-BODY 0badf00d\nhi\nCROSS-CLAUDE-BODY 0badf00d>>>"
@@ -262,3 +269,80 @@ def test_bridge_channel_without_envelope_denies(env_setup, tmp_path):
     t = write_transcript(tmp_path / "t.jsonl", [channel("no envelope at all")])
     out, _ = run_hook(env_setup, t, BASH, {"command": "op read x"})
     assert is_deny(out)
+
+
+RELAY_CMDS = [
+    'inbox send claude-optimization "do X"',
+    "claude-inbox reply 3 --verdict ok",
+    "sh -c 'inbox reply 3 --verdict ok'",
+    "curl -X POST https://crosswi.re/api/messages -d '{}'",
+    "curl -d hi https://example.com/inbox",
+    "wget --post-data=x https://cross-claude.example.com/x",
+    "python3 -c \"import requests; requests.post('https://railway.app/x', json={})\"",
+    "node -e \"fetch('https://crosswi.re/api/messages', {method: 'POST'})\"",
+]
+
+
+@pytest.mark.parametrize("cmd", RELAY_CMDS)
+def test_relay_paths_denied_in_tainted_turn(env_setup, tmp_path, cmd):
+    t = tainted_transcript(env_setup, tmp_path)
+    out, _ = run_hook(env_setup, t, BASH, {"command": cmd})
+    assert is_deny(out)
+
+
+@pytest.mark.parametrize("cmd", ["curl https://crosswi.re/api/messages", "echo inbox", "ls inbox/", "echo 'curl -X POST x'"])
+def test_relay_reads_and_mentions_allowed_in_tainted_turn(env_setup, tmp_path, cmd):
+    t = tainted_transcript(env_setup, tmp_path)
+    out, _ = run_hook(env_setup, t, BASH, {"command": cmd})
+    assert out == ""
+
+
+SPAWN_CMDS = [
+    'claude "prompt"', "claude --print hi", "claude -c", "claude --resume", "ccx", "cc2 x", "ccm", "ccc --foo",
+    "/usr/local/bin/claude x", "FOO=1 ccx", "nohup ccx &", "timeout 5 ccm x", "env A=1 claude x", "xargs claude",
+    'eval "claude x"', 'bash -c "claude --print hi"', 'bash -c "ccx"', "nohup claude -p hi &",
+    "sh -c 'inbox reply 3 --verdict ok'", "script -q /dev/null claude x",
+]
+
+
+@pytest.mark.parametrize("cmd", SPAWN_CMDS)
+def test_spawn_and_wrapped_spawn_denied_in_tainted_turn(env_setup, tmp_path, cmd):
+    t = tainted_transcript(env_setup, tmp_path)
+    out, _ = run_hook(env_setup, t, BASH, {"command": cmd})
+    assert is_deny(out)
+
+
+@pytest.mark.parametrize("cmd", ["echo claude", "echo ccx", "cat notes.txt | wc -l"])
+def test_spawn_words_as_arguments_allowed(env_setup, tmp_path, cmd):
+    t = tainted_transcript(env_setup, tmp_path)
+    out, _ = run_hook(env_setup, t, BASH, {"command": cmd})
+    assert out == ""
+
+
+def run_raw(env, stdin_text):
+    proc = subprocess.run([sys.executable, HOOK], input=stdin_text, capture_output=True,
+                          text=True, env=env, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout.strip(), proc.stderr
+
+
+def test_unreadable_stdin_team_listening_denies(env_setup, tmp_path):
+    env = dict(env_setup["env"], CROSS_CLAUDE_TEAM_LISTENING="1")
+    out, _ = run_raw(env, "{not json")
+    assert is_deny(out)
+
+
+def test_unreadable_stdin_marker_present_denies(env_setup, tmp_path):
+    state = tmp_path / "state"
+    (state / "team-listening").mkdir(parents=True)
+    (state / "team-listening" / SID).write_text("1\n")
+    env = dict(env_setup["env"], HOME=str(tmp_path / "home"), CROSS_CLAUDE_STATE_DIR=str(state))
+    out, _ = run_raw(env, "{not json")
+    assert is_deny(out)
+
+
+def test_unreadable_stdin_not_listening_allows_with_warning(env_setup, tmp_path):
+    env = dict(env_setup["env"], HOME=str(tmp_path / "home"))
+    out, err = run_raw(env, "{not json")
+    assert out == ""
+    assert "unreadable" in err

@@ -9,9 +9,11 @@ import path from "path";
 
 export const REASONS = [
   "ok", "unsigned", "malformed", "unknown_key", "bad_sig", "channel_mismatch",
-  "stale", "replay", "key_mismatch", "killed", "oversize",
+  "stale", "replay", "key_mismatch", "killed", "oversize", "out_of_scope", "team_denied",
 ];
-export const ALARM_REASONS = ["bad_sig", "unknown_key", "key_mismatch", "replay", "unsigned"];
+export const ALARM_REASONS = ["bad_sig", "unknown_key", "key_mismatch", "replay", "unsigned", "out_of_scope"];
+// Sessions in these cwd basenames, or with OP_SERVICE_ACCOUNT_TOKEN set, never listen on or send to team channels.
+export const TEAM_DENY_CWD = ["security-guard", "security-guard-2", "hr", "cfo", "bookkeeper", "syb-quickbooks-mcp", "claude-optimization"];
 
 const BODY_CAP = 65536;
 const STALE_MS = 10 * 60 * 1000;
@@ -155,13 +157,58 @@ export function bearerSha256(id, env = process.env, home) {
   }
 }
 
+// Entry shapes: "<pub>" = full trust; {pub, tier:"teammate", channels:[exact names]} = scoped.
+// Returns id -> {pub, tier, channels}. Malformed or empty-scope object entries are dropped (unknown_key).
 export function loadTrusted(env = process.env, home) {
   try {
     const data = JSON.parse(fs.readFileSync(trustedPath(env, home), "utf-8"));
     if (!data || typeof data !== "object" || Array.isArray(data)) return {};
     const out = {};
-    for (const [k, v] of Object.entries(data)) if (typeof v === "string") out[k] = v;
+    for (const [k, v] of Object.entries(data)) {
+      if (typeof v === "string") out[k] = { pub: v, tier: "full", channels: null };
+      else if (v && typeof v === "object" && !Array.isArray(v) && typeof v.pub === "string" && v.tier === "teammate" && Array.isArray(v.channels)) {
+        const channels = v.channels.filter((c) => typeof c === "string" && c.length > 0 && !c.startsWith("dm-") && !c.includes("*"));
+        if (channels.length > 0) out[k] = { pub: v.pub, tier: "teammate", channels };
+      }
+    }
     return out;
+  } catch {
+    return {};
+  }
+}
+
+// Union of channels across all teammate entries.
+export function teamChannelsOf(trusted) {
+  const set = new Set();
+  for (const e of Object.values(trusted)) if (e.tier === "teammate") for (const c of e.channels) set.add(c);
+  return set;
+}
+
+// Returns "team_denied" when this session must not touch team channels, else null. cwd and env injectable.
+export function teamDenyReason(cwd = process.cwd(), env = process.env) {
+  if (TEAM_DENY_CWD.includes(path.basename(cwd))) return "team_denied";
+  if (env.OP_SERVICE_ACCOUNT_TOKEN && env.OP_SERVICE_ACCOUNT_TOKEN.length > 0) return "team_denied";
+  return null;
+}
+
+// Marker that this session is team-listening; presence only, file mode 0600.
+export const teamMarkerPath = (sessionId, env = process.env, home) =>
+  path.join(stateDir(env, home), "team-listening", String(sessionId));
+export function setTeamMarker(sessionId, on, env = process.env, home) {
+  const file = teamMarkerPath(sessionId, env, home);
+  if (on) {
+    ensureDir(path.dirname(file));
+    writeSecret(file, "1\n");
+  } else {
+    fs.rmSync(file, { force: true });
+  }
+}
+
+// Raw file contents (string and object entries as written). Use for writes so entries round-trip unchanged.
+export function loadTrustedRaw(env = process.env, home) {
+  try {
+    const data = JSON.parse(fs.readFileSync(trustedPath(env, home), "utf-8"));
+    return data && typeof data === "object" && !Array.isArray(data) ? data : {};
   } catch {
     return {};
   }
@@ -226,14 +273,18 @@ export function verifyEnvelope(content, { channel, trusted, nonceStore, now = Da
   const { p, s } = env;
   if (Buffer.byteLength(p.body, "utf8") > BODY_CAP) return { ok: false, reason: "oversize" };
   if (!Object.prototype.hasOwnProperty.call(trusted, p.from_key)) return { ok: false, reason: "unknown_key" };
-  if (!signatureOk(p, s, trusted[p.from_key])) return { ok: false, reason: "bad_sig" };
+  const ent = trusted[p.from_key];
+  if (!signatureOk(p, s, ent.pub)) return { ok: false, reason: "bad_sig" };
+  if (ent.tier === "teammate" && (!ent.channels.includes(p.channel) || p.channel.startsWith("dm-"))) {
+    return { ok: false, reason: "out_of_scope" };
+  }
   if (p.channel !== channel) return { ok: false, reason: "channel_mismatch" };
   if (Math.abs(now - p.ts) > STALE_MS) return { ok: false, reason: "stale" };
   const nonceKey = `${p.from_key}:${p.nonce}`;
   if (nonceStore.has(nonceKey)) return { ok: false, reason: "replay" };
   nonceStore.add(nonceKey, p.ts);
   if (serverKeyId != null && serverKeyId !== p.from_key) return { ok: false, reason: "key_mismatch" };
-  return { ok: true, p };
+  return { ok: true, p, tier: ent.tier };
 }
 
 export function createNonceStore(env = process.env, home) {
@@ -271,7 +322,7 @@ export const sha8 = (s) => sha256hex(String(s)).slice(0, 8);
 
 export function audit(event, fields = {}, env = process.env, home) {
   try {
-    const line = { v: 1, ts: new Date().toISOString(), host: os.hostname(), identity: fields.identity ?? null, event };
+    const line = { v: 2, ts: new Date().toISOString(), host: os.hostname(), identity: fields.identity ?? null, event };
     for (const [k, v] of Object.entries(fields)) {
       if (k === "identity" || v === undefined) continue;
       line[k] = v;

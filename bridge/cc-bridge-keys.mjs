@@ -14,13 +14,14 @@ import {
   ensureIdentity,
   loadIdentity,
   loadTrusted,
+  loadTrustedRaw,
   writeTrusted,
 } from "./trust.mjs";
 
 const USAGE = `usage:
   cc-bridge-keys init [--identity ID] [--force]
   cc-bridge-keys show [--identity ID]
-  cc-bridge-keys trust <id> <pubkey-b64>
+  cc-bridge-keys trust <id> <pubkey-b64> [--teammate --channels a,b]
   cc-bridge-keys untrust <id>
   cc-bridge-keys list
   cc-bridge-keys server-keys [--identity ID]`;
@@ -32,7 +33,7 @@ function fail(message, code = 1) {
 
 function parseArgs(argv) {
   const positional = [];
-  const opts = { identity: null, force: false };
+  const opts = { identity: null, force: false, teammate: false, channels: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--identity") {
@@ -40,6 +41,11 @@ function parseArgs(argv) {
       opts.identity = argv[++i];
     } else if (a === "--force") {
       opts.force = true;
+    } else if (a === "--teammate") {
+      opts.teammate = true;
+    } else if (a === "--channels") {
+      if (i + 1 >= argv.length) fail("--channels needs a value", 2);
+      opts.channels = argv[++i];
     } else {
       positional.push(a);
     }
@@ -89,9 +95,9 @@ function cmdShow(opts) {
   printIdentity(resolveIdentity(opts), false, false);
 }
 
-function cmdTrust(args) {
+function cmdTrust(args, opts) {
   const [id, pub] = args;
-  if (!id || !pub) fail("usage: cc-bridge-keys trust <id> <pubkey-b64>", 2);
+  if (!id || !pub) fail("usage: cc-bridge-keys trust <id> <pubkey-b64> [--teammate --channels a,b]", 2);
   try {
     assertId(id);
   } catch {
@@ -99,16 +105,28 @@ function cmdTrust(args) {
   }
   const normalized = pub.trim();
   if (!validPubkey(normalized)) fail("pubkey is not a valid base64 ed25519 SPKI key", 2);
-  const trusted = loadTrusted();
-  trusted[id] = normalized;
+  let entry = normalized;
+  if (opts.teammate) {
+    const channels = String(opts.channels ?? "").split(",").map((c) => c.trim()).filter(Boolean);
+    if (channels.length === 0) fail("--teammate needs --channels a,b (exact channel names)", 2);
+    for (const c of channels) {
+      if (c.startsWith("dm-")) fail(`refusing teammate channel "${c}": dm-* inboxes are never shared`, 2);
+      if (c.includes("*")) fail(`refusing teammate channel "${c}": wildcards are not allowed`, 2);
+    }
+    entry = { pub: normalized, tier: "teammate", channels };
+  } else if (opts.channels) {
+    fail("--channels requires --teammate", 2);
+  }
+  const trusted = loadTrustedRaw();
+  trusted[id] = entry;
   writeTrusted(trusted);
-  process.stdout.write(`trusted: ${id}\n`);
+  process.stdout.write(`trusted: ${id}${opts.teammate ? ` (teammate: ${entry.channels.join(",")})` : ""}\n`);
 }
 
 function cmdUntrust(args) {
   const [id] = args;
   if (!id) fail("usage: cc-bridge-keys untrust <id>", 2);
-  const trusted = loadTrusted();
+  const trusted = loadTrustedRaw();
   if (!Object.prototype.hasOwnProperty.call(trusted, id)) {
     process.stdout.write(`not trusted: ${id}\n`);
     return;
@@ -139,7 +157,7 @@ function main() {
     case "show":
       return cmdShow(opts);
     case "trust":
-      return cmdTrust(positional);
+      return cmdTrust(positional, opts);
     case "untrust":
       return cmdUntrust(positional);
     case "list":
