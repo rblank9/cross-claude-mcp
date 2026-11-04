@@ -20,7 +20,7 @@ You need macOS with `git` and Node.js 22 or newer, Claude Code signed in with yo
    ```
    It prints your identity, your public key, and your bearer's sha256. The private key and the bearer itself stay in `~/.config/cross-claude/`. Never copy anything out of that folder.
 
-3. In your vault, create one item named "bridge identity" with three fields: `identity` (`<yourname>-mac`), `pubkey` (the public key from step 2), and `bearer_sha256` (the 64-character sha256 from step 2, never the bearer). Tell R it's there. security-guard checks who created it and that nothing secret is in it, then adds you to the server, limited to `team-syb`.
+3. From your own 1Password account, in your vault, create one Secure Note titled `bridge-key <yourname>-mac` with exactly three fields: `identity` (`<yourname>-mac`), `pubkey` (the public key from step 2), and `bearer_sha256` (the 64-character sha256 from step 2). Put nothing else in it: no bearer, no private key, no file contents. An item with anything extra gets rejected, and you'd re-run step 2 with `--force`. Tell R it's there. security-guard checks who created it and that nothing secret is in it, then adds you to the server, limited to `team-syb`.
 
 4. security-guard puts R's public keys into the same vault, in an item created by R's account. Check that R created it, then trust each key:
    ```bash
