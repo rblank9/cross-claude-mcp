@@ -13,6 +13,7 @@ import { STALE_THRESHOLD_SECONDS } from "./tools.mjs";
 import { normalizeChannelName } from "./db.mjs";
 import { messageEvents } from "./message-events.mjs";
 import { scopeRefuse, scopeSendAllowed, nameBound, SCOPE_CONTENT_MAX } from "./scope-guard.mjs";
+import { channelAllowed, isTeamRoom, TEAM_PATTERN, TEAM_ROOM_CAP } from "./scope-match.mjs";
 
 // Gate 6: scoped (teammate) keys. server.mjs sets req.scope to {channels: Set, prefix} or null when unscoped.
 // Fail closed: a scoped key reaches only the routes below; every other route is 403.
@@ -27,8 +28,8 @@ const SCOPED_ROUTES = [
   ["GET", /^\/search$/],
   ["GET", /^\/instances$/],
 ];
-const inScope = (req, channel) => !req.scope || req.scope.channels.has(channel);
-const filterScope = (req, rows, field) => (req.scope ? rows.filter((row) => req.scope.channels.has(row[field])) : rows);
+const inScope = (req, channel) => !req.scope || channelAllowed(req.scope.channels, channel);
+const filterScope = (req, rows, field) => (req.scope ? rows.filter((row) => channelAllowed(req.scope.channels, row[field])) : rows);
 const denyScope = (req, res) => scopeRefuse(req, res, "out_of_scope", 403);
 
 /**
@@ -37,6 +38,13 @@ const denyScope = (req, res) => scopeRefuse(req, res, "out_of_scope", 403);
  */
 export function createRestRouter(db) {
   const router = Router();
+  // Concrete channel names a scoped key may see: its exact names, plus every existing team room if it holds "team-*".
+  const scopeChannelNames = async (req) => {
+    const exact = [...req.scope.channels].filter((c) => c !== TEAM_PATTERN);
+    if (!req.scope.channels.has(TEAM_PATTERN)) return exact;
+    const rooms = (await db.listChannels()).map((c) => c.name).filter(isTeamRoom);
+    return [...new Set([...exact, ...rooms])];
+  };
   router.use((req, res, next) => {
     if (!req.scope) return next();
     if (SCOPED_ROUTES.some(([method, re]) => method === req.method && re.test(req.path))) return next();
@@ -65,7 +73,7 @@ export function createRestRouter(db) {
   router.get("/instances", async (req, res, next) => {
     try {
       await db.markStaleOffline(STALE_THRESHOLD_SECONDS);
-      const instances = req.scope ? await db.listInstancesPostedIn([...req.scope.channels]) : await db.listInstances();
+      const instances = req.scope ? await db.listInstancesPostedIn(await scopeChannelNames(req)) : await db.listInstances();
       res.json({ instances });
     } catch (e) { next(e); }
   });
@@ -117,6 +125,14 @@ export function createRestRouter(db) {
         if (!nameBound(req.scope, sender)) return denyScope(req, res);
         if (Buffer.byteLength(String(content)) > SCOPE_CONTENT_MAX) return scopeRefuse(req, res, "payload_too_large", 413);
         if (!scopeSendAllowed(req.keyId)) return scopeRefuse(req, res, "rate_limited", 429);
+      }
+      // team-* rooms (SG 2026-11-17): at most TEAM_ROOM_CAP server-wide; the first post to a new room is logged.
+      if (isTeamRoom(normalized)) {
+        const names = (await db.listChannels()).map((c) => c.name);
+        if (!names.includes(normalized)) {
+          if (names.filter(isTeamRoom).length >= TEAM_ROOM_CAP) return scopeRefuse(req, res, "room_cap", 409);
+          console.error(`[SCOPE] new_room key=${req.keyId} room=${normalized}`);
+        }
       }
       // Auto-create channel if it doesn't exist
       await db.createChannel(normalized, null);

@@ -22,6 +22,7 @@ import { createRestRouter } from "./rest-api.mjs";
 import { InviteCodeOAuthProvider, createAuthorizeSubmitHandler } from "./auth.mjs";
 import { requestContext } from "./request-context.mjs";
 import { scopeRefuse } from "./scope-guard.mjs";
+import { TEAM_PATTERN } from "./scope-match.mjs";
 import { createHash, timingSafeEqual } from "crypto";
 
 // Parses CROSS_CLAUDE_KEYS (raw JSON object, or base64 of one) into [id, sha256 digest] pairs.
@@ -56,7 +57,8 @@ function loadKeyEntries(raw) {
 
 // Parses CROSS_CLAUDE_SCOPES (raw JSON object, or base64 of one) into Map<keyId, {channels: Set, prefix}> (Gate 6).
 // Value: ["team-syb", ...] (no register or send allowed) or {"channels": [...], "instance_prefix": "vicky"}.
-// Channel names are exact (no wildcards). dm-* channels are dropped. Malformed input logs and yields an empty map; never throws.
+// Channel names are exact, except the ONE pattern form "team-*" (scope-match.mjs; SG 2026-11-17), granted per key.
+// Any other wildcard is rejected. dm-* channels are dropped. Malformed input logs and yields an empty map; never throws.
 function loadKeyScopes(raw) {
   if (!raw) return new Map();
   let parsed;
@@ -92,8 +94,10 @@ function loadKeyScopes(raw) {
     }
     const channels = new Set();
     for (const name of list) {
-      if (name.includes("*")) {
-        console.error(`[SCOPE] wildcard "${name}" in scope of key "${id}" rejected; scopes take exact names`);
+      if (name === TEAM_PATTERN) {
+        channels.add(TEAM_PATTERN);
+      } else if (name.includes("*")) {
+        console.error(`[SCOPE] wildcard "${name}" in scope of key "${id}" rejected; scopes take exact names or the literal "${TEAM_PATTERN}"`);
       } else if (normalizeChannelName(name) === null) {
         console.error(`[SCOPE] invalid channel "${name}" in scope of key "${id}"; dropped`);
       } else if (normalizeChannelName(name).startsWith("dm-")) {

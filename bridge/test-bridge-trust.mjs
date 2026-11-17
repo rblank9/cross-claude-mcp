@@ -11,7 +11,7 @@ import { tmpdir, homedir } from "os";
 import crypto from "crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { signEnvelope, parseEnvelope, canonical, sha8, REASONS, loadTrusted, verifyEnvelope, createNonceStore, teamDenyReason, setTeamMarker, teamMarkerPath, recordDrop, teamChannelsOf, resolveHome, resolveSessionPid, courierInvocation, parseWinProcessTable, windowsProcessTable } from "./trust.mjs";
+import { signEnvelope, parseEnvelope, canonical, sha8, REASONS, loadTrusted, verifyEnvelope, createNonceStore, teamDenyReason, setTeamMarker, teamMarkerPath, recordDrop, teamChannelsOf, isTeamChannel, resolveHome, resolveSessionPid, courierInvocation, parseWinProcessTable, windowsProcessTable } from "./trust.mjs";
 import { deliveryHeader } from "./cross-claude-bridge.mjs";
 import { statSync } from "fs";
 
@@ -387,7 +387,8 @@ async function runTeammateUnit() {
     const FULL = mk();
     const BAD = mk();
     const UNK = mk();
-    const trustedFile = { "tm-alpha": { pub: TM.pub, tier: "teammate", channels: ["team-syb"] }, "full-alpha": FULL.pub, "tm-bad": { pub: BAD.pub, tier: "teammate", channels: ["dm-x", "a*"] }, "tm-unk": { pub: UNK.pub, tier: "guest", channels: ["team-syb"] } };
+    const ROOM = mk();
+    const trustedFile = { "tm-alpha": { pub: TM.pub, tier: "teammate", channels: ["team-syb"] }, "full-alpha": FULL.pub, "tm-bad": { pub: BAD.pub, tier: "teammate", channels: ["dm-x", "a*", "team*"] }, "tm-unk": { pub: UNK.pub, tier: "guest", channels: ["team-syb"] }, "tm-room": { pub: ROOM.pub, tier: "teammate", channels: ["team-*"] } };
     mkdirSync(join(U, "cfg"), { recursive: true });
     writeFileSync(join(U, "cfg", "trusted_keys.json"), JSON.stringify(trustedFile));
     const trusted = loadTrusted(env, U);
@@ -406,6 +407,16 @@ async function runTeammateUnit() {
     check(!r5.ok && r5.reason === "unknown_key", "malformed object entry (no valid channels): unknown_key");
     const r6 = verify(UNK.pem, "tm-unk", "team-syb", "unk");
     check(!r6.ok && r6.reason === "unknown_key", "object entry with unknown tier: unknown_key");
+    // team-* rooms (SG 2026-11-17): the one allowed pattern form, matched by the shared scope-match.mjs.
+    check(JSON.stringify(trusted["tm-room"]?.channels) === '["team-*"]', 'loadTrusted keeps the literal "team-*" grant');
+    const r7 = verify(ROOM.pem, "tm-room", "team-ads", "room");
+    check(r7.ok && r7.tier === "teammate", "team-* grant: team room delivered, tier teammate");
+    const r8 = ["general", "team-", "teamx", "dm-x", "team-" + "a".repeat(32)].map((ch) => verify(ROOM.pem, "tm-room", ch, "x"));
+    check(r8.every((r) => !r.ok && r.reason === "out_of_scope"), "team-* grant: general, team-, teamx, dm-x, over-length all out_of_scope");
+    const r9 = verify(TM.pem, "tm-alpha", "team-ads", "exact-only");
+    check(!r9.ok && r9.reason === "out_of_scope", "exact team-syb grant: a team room is still out_of_scope");
+    check(isTeamChannel(trusted, "team-ads") && isTeamChannel(trusted, "team-syb") && !isTeamChannel(trusted, "general") && !isTeamChannel(trusted, "team-*"),
+      "isTeamChannel: team rooms and team-syb yes; general and the literal team-* no");
 
     const teamHdr = deliveryHeader("team-syb", "inst", "tm-alpha", "teammate");
     check(teamHdr.includes("TEAMMATE") && !teamHdr.includes("(verified key"), "teammate header contains TEAMMATE and not (verified key");
@@ -438,6 +449,10 @@ async function runTeammateUnit() {
     check(refuse.status !== 0 && notWritten, "cc-bridge-keys trust --teammate refuses dm-x and writes nothing");
     const okCli = tmCli(["trust", "tm-y", TM.pub, "--teammate", "--channels", "team-syb"]);
     check(okCli.status === 0 && loadTrusted(env, U)["tm-y"]?.tier === "teammate", "cc-bridge-keys trust --teammate team-syb writes the object form");
+    const okRoom = tmCli(["trust", "tm-z", TM.pub, "--teammate", "--channels", "team-*"]);
+    check(okRoom.status === 0 && JSON.stringify(loadTrusted(env, U)["tm-z"]?.channels) === '["team-*"]', 'cc-bridge-keys trust --teammate accepts the literal "team-*"');
+    const badWild = tmCli(["trust", "tm-w", TM.pub, "--teammate", "--channels", "x-*"]);
+    check(badWild.status !== 0 && !readFileSync(join(U, "cfg", "trusted_keys.json"), "utf8").includes("tm-w"), "cc-bridge-keys trust --teammate refuses any other wildcard (x-*) and writes nothing");
   } finally {
     rmSync(U, { recursive: true, force: true });
   }

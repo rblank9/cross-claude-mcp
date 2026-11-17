@@ -7,6 +7,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
+import { TEAM_PATTERN } from "../scope-match.mjs";
 import {
   assertId,
   bearerSha256,
@@ -108,10 +109,10 @@ function cmdTrust(args, opts) {
   let entry = normalized;
   if (opts.teammate) {
     const channels = String(opts.channels ?? "").split(",").map((c) => c.trim()).filter(Boolean);
-    if (channels.length === 0) fail("--teammate needs --channels a,b (exact channel names)", 2);
+    if (channels.length === 0) fail('--teammate needs --channels a,b (exact channel names, or the literal "team-*")', 2);
     for (const c of channels) {
       if (c.startsWith("dm-")) fail(`refusing teammate channel "${c}": dm-* inboxes are never shared`, 2);
-      if (c.includes("*")) fail(`refusing teammate channel "${c}": wildcards are not allowed`, 2);
+      if (c.includes("*") && c !== TEAM_PATTERN) fail(`refusing teammate channel "${c}": the only wildcard allowed is "${TEAM_PATTERN}"`, 2);
     }
     entry = { pub: normalized, tier: "teammate", channels };
   } else if (opts.channels) {

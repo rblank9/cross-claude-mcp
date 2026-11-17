@@ -385,14 +385,15 @@ const main = async () => {
     passed += h3.passed ? 1 : 0;
     failed += h3.passed ? 0 : 1;
 
-    // Scenario SCOPE (Gate 6). TOK_B: object scope, instance_prefix "vicky", with a dm-x entry and a wildcard that are dropped.
-    // TOK_C: array scope (no register, no send). TOK_A: unscoped.
+    // Scenario SCOPE (Gate 6). TOK_B: object scope, instance_prefix "vicky", with a dm-x entry and a non-team wildcard
+    // ("x-*") that are dropped, plus the "team-*" room grant (SG 2026-11-17). TOK_C: array scope, exact team-syb only
+    // (no register, no send, no team-* grant). TOK_A: unscoped.
     await stopServer(serverProc);
     serverProc = null;
     const scopeEnv = {
       ...mainEnv,
       CROSS_CLAUDE_SCOPES: JSON.stringify({
-        "host-b": { channels: ["team-syb", "dm-x", "team-*"], instance_prefix: "vicky" },
+        "host-b": { channels: ["team-syb", "dm-x", "x-*", "team-*"], instance_prefix: "vicky" },
         "host-c": ["team-syb"]
       })
     };
@@ -439,6 +440,58 @@ const main = async () => {
       failed += t.passed ? 0 : 1;
     }
 
+    // team-* rooms (SG 2026-11-17). Reads only from TOK_B here: its POSTs are counted by the RL test below.
+    const longOk = "team-" + "a".repeat(31); // 36 chars: the longest legal room name
+    const roomCases = [
+      ['R1. team-* grant: GET a team room', await req('GET', '/api/messages/team-ads?limit=1', { token: TOK_B }), 200],
+      ['R2. team-* grant: GET the longest legal room name', await req('GET', `/api/messages/${longOk}?limit=1`, { token: TOK_B }), 200],
+      ['R3. "team-" alone: 403', await req('GET', '/api/messages/team-?limit=1', { token: TOK_B }), 403],
+      ['R4. "teamx": 403', await req('GET', '/api/messages/teamx?limit=1', { token: TOK_B }), 403],
+      ['R5. literal "team-*" as a channel name: 403', await req('GET', `/api/messages/${encodeURIComponent("team-*")}?limit=1`, { token: TOK_B }), 403],
+      ['R6. uppercase "TEAM-ADS": 403', await req('GET', '/api/messages/TEAM-ADS?limit=1', { token: TOK_B }), 403],
+      ['R7. Cyrillic lookalike "tеam-ads": 403', await req('GET', `/api/messages/${encodeURIComponent("tеam-ads")}?limit=1`, { token: TOK_B }), 403],
+      ['R8. over-length room name (37 chars): 403', await req('GET', `/api/messages/${longOk}a?limit=1`, { token: TOK_B }), 403],
+      ['R9. no team-* grant (TOK_C) on a team room: 403', await req('GET', '/api/messages/team-ads?limit=1', { token: TOK_C }), 403],
+      ['R10. team-* grant still cannot read general: 403', await req('GET', '/api/messages/general?limit=1', { token: TOK_B }), 403],
+    ];
+    for (const [label, r, want] of roomCases) {
+      const t = assert(r.status === want && (want === 200 || r.json?.error === "out_of_scope"), `${label} (got ${r.status})`);
+      passed += t.passed ? 1 : 0;
+      failed += t.passed ? 0 : 1;
+    }
+    const roomStreams = [
+      ['R11. team-* grant: stream on a team room', await streamStatus('/api/stream?channels=team-ads', TOK_B), 200],
+      ['R12. team-* grant: stream with general mixed in: 403', await streamStatus('/api/stream?channels=team-ads,general', TOK_B), 403],
+    ];
+    for (const [label, got, want] of roomStreams) {
+      const t = assert(got === want, `${label} (got ${got})`);
+      passed += t.passed ? 1 : 0;
+      failed += t.passed ? 0 : 1;
+    }
+    // Cap: team-syb already exists, so 19 more rooms reach 20; the 21st new room is refused. Existing rooms still post.
+    const capStatuses = [];
+    for (let i = 1; i <= 19; i += 1) {
+      capStatuses.push((await req('POST', '/api/messages', { token: TOK_A, body: { channel: `team-r${i}`, sender: "r-room", content: "x" } })).status);
+    }
+    const over = await req('POST', '/api/messages', { token: TOK_A, body: { channel: "team-r20", sender: "r-room", content: "x" } });
+    const again = await req('POST', '/api/messages', { token: TOK_A, body: { channel: "team-r1", sender: "r-room", content: "y" } });
+    const cap = assert(capStatuses.every((x) => x === 200) && over.status === 409 && over.json?.error === "room_cap" && again.status === 200,
+      `R13. room cap: 20 team rooms OK, the 21st refused 409 room_cap, an existing room still posts (got ${capStatuses.filter((x) => x !== 200).length} non-200, over=${over.status}, again=${again.status})`);
+    passed += cap.passed ? 1 : 0;
+    failed += cap.passed ? 0 : 1;
+    const bList = await req('GET', '/api/channels', { token: TOK_B });
+    const bNames = (bList.json?.channels || []).map((c) => c.name);
+    const lst = assert(bNames.includes("team-r1") && bNames.includes("team-syb") && !bNames.includes("general") && !bNames.includes("team-r20"),
+      `R14. team-* grant: channel list shows team rooms only (got ${bNames.length}: ${bNames.slice(0, 5).join(",")}...)`);
+    passed += lst.passed ? 1 : 0;
+    failed += lst.passed ? 0 : 1;
+    await new Promise((r) => setTimeout(r, 300));
+    const roomLogs = scopeStderr();
+    const nl = assert(roomLogs.includes('[SCOPE] new_room key=host-a room=team-r1') && roomLogs.includes('[SCOPE] room_cap key=host-a') && !roomLogs.includes('new_room key=host-a room=team-r20'),
+      'R15. first post to a new room logs [SCOPE] new_room; the cap refusal logs [SCOPE] room_cap');
+    passed += nl.passed ? 1 : 0;
+    failed += nl.passed ? 0 : 1;
+
     const s13 = assert((await streamStatus('/api/stream?channels=team-syb,general', TOK_B)) === 403, 'S13. scoped /stream?channels=team-syb,general: 403 (whole request)');
     passed += s13.passed ? 1 : 0;
     failed += s13.passed ? 0 : 1;
@@ -461,9 +514,10 @@ const main = async () => {
     passed += s16.passed ? 1 : 0;
     failed += s16.passed ? 0 : 1;
 
-    const s17Res = await req('GET', '/api/channels', { token: TOK_B });
+    // TOK_C holds exact team-syb only (TOK_B also holds team-*, covered by R14), so it must see team-syb and nothing else.
+    const s17Res = await req('GET', '/api/channels', { token: TOK_C });
     const s17Names = (s17Res.json?.channels || []).map((c) => c.name);
-    const s17 = assert(s17Res.status === 200 && s17Names.includes("team-syb") && s17Names.every((n) => n === "team-syb"), 'S17. scoped /channels lists only team-syb');
+    const s17 = assert(s17Res.status === 200 && s17Names.includes("team-syb") && s17Names.every((n) => n === "team-syb"), 'S17. exact-scope /channels lists only team-syb (no team rooms without a team-* grant)');
     passed += s17.passed ? 1 : 0;
     failed += s17.passed ? 0 : 1;
 
@@ -496,7 +550,7 @@ const main = async () => {
 
     await new Promise((r) => setTimeout(r, 300));
     const logs = scopeStderr();
-    const s19 = assert(logs.includes('dropped dm- channel "dm-x"') && logs.includes('wildcard "team-*"') && logs.includes('[SCOPE] out_of_scope key=host-b route=GET /api/messages/dm-x'), 'L1. dm-x and wildcard dropped from scope env; out_of_scope logged');
+    const s19 = assert(logs.includes('dropped dm- channel "dm-x"') && logs.includes('wildcard "x-*"') && !logs.includes('wildcard "team-*"') && logs.includes('[SCOPE] out_of_scope key=host-b route=GET /api/messages/dm-x'), 'L1. dm-x and non-team wildcard dropped from scope env ("team-*" kept); out_of_scope logged');
     passed += s19.passed ? 1 : 0;
     failed += s19.passed ? 0 : 1;
     const s20 = assert(logs.includes('[SCOPE] rate_limited key=host-b') && logs.includes('[SCOPE] payload_too_large key=host-b') && logs.includes('[SCOPE] ALARM key=host-b'), 'L2. 429 and 413 logged with [SCOPE] format; ALARM emitted at 5+ refusals');

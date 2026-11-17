@@ -17,7 +17,7 @@ import {
   resolveHome,
   resolveSessionPid,
   setTeamMarker,
-  teamChannelsOf,
+  isTeamChannel,
   teamDenyReason,
   recordDrop,
   sha8,
@@ -30,7 +30,7 @@ import {
 // as notifications/claude/channel. Reconnects with backoff and resumes from a cursor.
 // Gates 2-5 (docs/plans/bridge-trust.md): only messages signed by a trusted identity are delivered.
 
-const VERSION = "0.5.1";
+const VERSION = "0.6.0";
 const BODY_CAP = 65536;
 const DEFAULT_URL = "https://cross-claude-mcp-production.up.railway.app";
 const AUTH_HEADER = "Authorization";
@@ -204,7 +204,7 @@ async function main() {
   const drop = (reason, f = {}) => recordDrop(reason, { identity: identityName, ...f });
   // Team channels (scoped teammate entries) are refused here, and by listen_live and send.
   const teamRefusal = (ch) => {
-    if (!teamChannelsOf(loadTrusted()).has(ch)) return null;
+    if (!isTeamChannel(loadTrusted(), ch)) return null;
     if (teamDenyReason()) {
       drop("team_denied", { channel: ch });
       return `Refused: #${ch} is a team channel and this session may not join or send to team channels.`;
@@ -218,9 +218,9 @@ async function main() {
   // Keeps <stateDir>/team-listening/<sessionId> present exactly while a team channel is listened to.
   const syncTeamMarker = () => {
     if (!sessionId) return;
-    const team = teamChannelsOf(loadTrusted());
+    const trusted = loadTrusted();
     try {
-      setTeamMarker(sessionId, [...channels].some((c) => team.has(c)));
+      setTeamMarker(sessionId, [...channels].some((c) => isTeamChannel(trusted, c)));
     } catch (e) {
       log(`team marker write failed: ${e.message}`);
     }

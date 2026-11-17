@@ -7,6 +7,7 @@ import { execFileSync } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { channelAllowed, TEAM_PATTERN } from "../scope-match.mjs";
 
 export const REASONS = [
   "ok", "unsigned", "malformed", "unknown_key", "bad_sig", "channel_mismatch",
@@ -232,7 +233,7 @@ export function bearerSha256(id, env = process.env, home) {
   }
 }
 
-// Entry shapes: "<pub>" = full trust; {pub, tier:"teammate", channels:[exact names]} = scoped.
+// Entry shapes: "<pub>" = full trust; {pub, tier:"teammate", channels:[exact names and/or "team-*"]} = scoped.
 // Returns id -> {pub, tier, channels}. Malformed or empty-scope object entries are dropped (unknown_key).
 export function loadTrusted(env = process.env, home) {
   try {
@@ -242,7 +243,9 @@ export function loadTrusted(env = process.env, home) {
     for (const [k, v] of Object.entries(data)) {
       if (typeof v === "string") out[k] = { pub: v, tier: "full", channels: null };
       else if (v && typeof v === "object" && !Array.isArray(v) && typeof v.pub === "string" && v.tier === "teammate" && Array.isArray(v.channels)) {
-        const channels = v.channels.filter((c) => typeof c === "string" && c.length > 0 && !c.startsWith("dm-") && !c.includes("*"));
+        const channels = v.channels.filter(
+          (c) => typeof c === "string" && c.length > 0 && !c.startsWith("dm-") && (!c.includes("*") || c === TEAM_PATTERN)
+        );
         if (channels.length > 0) out[k] = { pub: v.pub, tier: "teammate", channels };
       }
     }
@@ -257,6 +260,11 @@ export function teamChannelsOf(trusted) {
   const set = new Set();
   for (const e of Object.values(trusted)) if (e.tier === "teammate") for (const c of e.channels) set.add(c);
   return set;
+}
+
+// True when ch is a team channel: an exact teammate channel, or a team room under a teammate "team-*" grant.
+export function isTeamChannel(trusted, ch) {
+  return channelAllowed(teamChannelsOf(trusted), ch);
 }
 
 // Returns "team_denied" when this session must not touch team channels, else null. cwd and env injectable.
@@ -350,7 +358,7 @@ export function verifyEnvelope(content, { channel, trusted, nonceStore, now = Da
   if (!Object.prototype.hasOwnProperty.call(trusted, p.from_key)) return { ok: false, reason: "unknown_key" };
   const ent = trusted[p.from_key];
   if (!signatureOk(p, s, ent.pub)) return { ok: false, reason: "bad_sig" };
-  if (ent.tier === "teammate" && (!ent.channels.includes(p.channel) || p.channel.startsWith("dm-"))) {
+  if (ent.tier === "teammate" && !channelAllowed(ent.channels, p.channel)) {
     return { ok: false, reason: "out_of_scope" };
   }
   if (p.channel !== channel) return { ok: false, reason: "channel_mismatch" };
