@@ -7,12 +7,15 @@ import path from "path";
 import { spawn } from "child_process";
 import {
   audit,
+  courierInvocation,
   createNonceStore,
   identityFor,
   isKilled,
   loadIdentity,
   loadTrusted,
   readBearer,
+  resolveHome,
+  resolveSessionPid,
   setTeamMarker,
   teamChannelsOf,
   teamDenyReason,
@@ -122,14 +125,28 @@ function sessionIdFor(home, ppid) {
   return null;
 }
 
+function hasSessionFile(home, pid) {
+  return listDir(home).some((d) => {
+    if (!d.startsWith(".claude")) return false;
+    try {
+      JSON.parse(fs.readFileSync(path.join(home, d, "sessions", `${pid}.json`), "utf-8"));
+      return true;
+    } catch {
+      return false;
+    }
+  });
+}
+
 async function main() {
-  const home = process.env.HOME || os.homedir();
-  const sessionId = sessionIdFor(home, process.ppid);
+  const home = resolveHome();
+  // The Claude Code pid that owns this bridge. Same as process.ppid off win32.
+  const sessionPid = resolveSessionPid(process.ppid, { hasSession: (pid) => hasSessionFile(home, pid) });
+  const sessionId = sessionIdFor(home, sessionPid);
   const HOST = os.hostname();
   // Trust identity: one per (host, Claude config dir). Null when no parent session is found.
   let identityName = null;
   try {
-    identityName = identityFor(home, process.ppid, HOST);
+    identityName = identityFor(home, sessionPid, HOST);
   } catch {
     identityName = null;
   }
@@ -167,10 +184,10 @@ async function main() {
 
   const computeIdentity = () => {
     if (FIXED_ID) return { key: FIXED_ID, name: null, instanceId: FIXED_ID };
-    const name = sessionNameFor(home, process.ppid);
+    const name = sessionNameFor(home, sessionPid);
     const instanceId = name
       ? `${slug(name)}-${SHORT_HOST}`
-      : `${slug(path.basename(process.cwd()))}-${process.ppid}-${SHORT_HOST}`;
+      : `${slug(path.basename(process.cwd()))}-${sessionPid}-${SHORT_HOST}`;
     return { key: name || "", name, instanceId };
   };
 
@@ -323,10 +340,10 @@ async function main() {
     try {
       while (courierQueue.length && !stopping) {
         const { id, content } = courierQueue.shift();
-        const sock = sessionSocketFor(home, process.ppid);
+        const sock = sessionSocketFor(home, sessionPid);
         if (!sock) {
           courierFailures++;
-          courierLastError = `no messaging socket for parent pid ${process.ppid}`;
+          courierLastError = `no messaging socket for parent pid ${sessionPid}`;
           log(`courier: #${id} not delivered: ${courierLastError}`);
           continue;
         }
@@ -337,12 +354,22 @@ async function main() {
         const env = {};
         for (const [k, v] of Object.entries(process.env)) if (!PARENT_IDENTITY_ENV.test(k)) env[k] = v;
         const code = await new Promise((resolve) => {
-          const child = spawn(
-            COURIER_BIN,
-            ["-p", "--model", COURIER_MODEL, "--dangerously-skip-permissions", "--tools", "SendMessage",
-              "--strict-mcp-config", "--setting-sources", "", "--no-session-persistence", prompt],
-            { env, stdio: ["ignore", "ignore", "pipe"], timeout: COURIER_TIMEOUT_MS }
-          );
+          const inv = courierInvocation({
+            bin: COURIER_BIN,
+            args: ["-p", "--model", COURIER_MODEL, "--dangerously-skip-permissions", "--tools", "SendMessage",
+              "--strict-mcp-config", "--setting-sources", "", "--no-session-persistence"],
+            prompt,
+          });
+          const child = spawn(inv.command, inv.args, {
+            env,
+            shell: inv.shell,
+            stdio: [inv.stdin === null ? "ignore" : "pipe", "ignore", "pipe"],
+            timeout: COURIER_TIMEOUT_MS,
+          });
+          if (inv.stdin !== null) {
+            child.stdin.on("error", () => {});
+            child.stdin.end(inv.stdin);
+          }
           let err = "";
           child.stderr.on("data", (d) => { err = (err + d).slice(-400); });
           child.on("error", (e) => { err = e.message; resolve(-1); });

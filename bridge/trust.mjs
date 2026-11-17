@@ -3,6 +3,7 @@
 // Paths honor CROSS_CLAUDE_CONFIG_DIR / CROSS_CLAUDE_STATE_DIR, read at call time.
 
 import crypto from "crypto";
+import { execFileSync } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -30,16 +31,22 @@ export function assertId(id) {
   return id;
 }
 
-const resolveHome = (home) => home || process.env.HOME || os.homedir();
+// One home resolver for every path the bridge builds. On win32, HOME is ignored: Git Bash exports it as
+// /c/Users/x, which Node cannot open, so os.homedir() (USERPROFILE) is the only usable answer there.
+export function resolveHome(home, env = process.env, platform = process.platform) {
+  if (home) return home;
+  if (platform === "win32") return os.homedir();
+  return env.HOME || os.homedir();
+}
 
 export function configDir(env = process.env, home) {
   if (env.CROSS_CLAUDE_CONFIG_DIR) return env.CROSS_CLAUDE_CONFIG_DIR;
-  return path.join(resolveHome(home), ".config", "cross-claude");
+  return path.join(resolveHome(home, env), ".config", "cross-claude");
 }
 
 export function stateDir(env = process.env, home) {
   if (env.CROSS_CLAUDE_STATE_DIR) return env.CROSS_CLAUDE_STATE_DIR;
-  return path.join(resolveHome(home), ".local", "state", "cross-claude");
+  return path.join(resolveHome(home, env), ".local", "state", "cross-claude");
 }
 
 export const killFile = (env, home) => path.join(configDir(env, home), "KILL");
@@ -47,7 +54,7 @@ export const isKilled = (env, home) => fs.existsSync(killFile(env, home));
 export const trustedPath = (env, home) => path.join(configDir(env, home), "trusted_keys.json");
 
 export function defaultIdentity(env, home, hostname) {
-  const dir = env.CLAUDE_CONFIG_DIR || path.join(resolveHome(home), ".claude");
+  const dir = env.CLAUDE_CONFIG_DIR || path.join(resolveHome(home, env), ".claude");
   return `${slug(String(hostname).split(".")[0])}-${slug(path.basename(dir))}`;
 }
 
@@ -68,6 +75,74 @@ export function identityFor(home, ppid, hostname) {
     return `${slug(String(hostname).split(".")[0])}-${slug(entry)}`;
   }
   return null;
+}
+
+// win32 helpers. Every behavior change is gated on platform === "win32"; other platforms get the old values.
+
+// Parses windowsProcessTable's PowerShell JSON: one object, or an array of them.
+export function parseWinProcessTable(text) {
+  const table = new Map();
+  let rows;
+  try {
+    rows = JSON.parse(String(text ?? "").trim() || "[]");
+  } catch {
+    return table;
+  }
+  if (!Array.isArray(rows)) rows = [rows];
+  for (const r of rows) {
+    const pid = Number(r?.ProcessId);
+    const ppid = Number(r?.ParentProcessId);
+    if (Number.isInteger(pid) && pid > 0 && Number.isInteger(ppid) && ppid >= 0) table.set(pid, ppid);
+  }
+  return table;
+}
+
+const PS_PROCESS_QUERY =
+  "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress";
+
+// pid -> parent pid for every process. Any failure yields an empty Map, so callers fall back to the direct ppid.
+export function windowsProcessTable(run = execFileSync) {
+  try {
+    const out = run(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-Command", PS_PROCESS_QUERY],
+      { encoding: "utf8", timeout: 15000, windowsHide: true }
+    );
+    return parseWinProcessTable(out);
+  } catch {
+    return new Map();
+  }
+}
+
+// Finds the Claude Code pid that owns this MCP child. On win32 the child's direct parent is often a shell
+// (cmd.exe) or a .cmd shim, not Claude, so walk up until a pid has a sessions/<pid>.json.
+// Returns startPid unchanged off win32, and on any miss (the pre-existing behavior).
+export function resolveSessionPid(startPid, {
+  platform = process.platform,
+  hasSession,
+  listProcesses = windowsProcessTable,
+  maxHops = 8,
+} = {}) {
+  if (platform !== "win32") return startPid;
+  if (hasSession(startPid)) return startPid;
+  const table = listProcesses();
+  let pid = startPid;
+  for (let hop = 0; hop < maxHops; hop++) {
+    const parent = table.get(pid);
+    if (!parent || parent <= 0 || parent === pid) break;
+    pid = parent;
+    if (hasSession(pid)) return pid;
+  }
+  return startPid;
+}
+
+// Builds the courier spawn. Off win32 this is the original call: argv carries the prompt, no shell.
+// On win32, `claude` is often claude.cmd, which Node refuses to spawn without a shell and which a bare
+// "claude" never resolves to. So the call goes through the shell with a static argv, and the prompt
+// (it holds remote message text) goes on stdin, where the shell cannot re-parse it.
+export function courierInvocation({ bin, args, prompt, platform = process.platform }) {
+  if (platform !== "win32") return { command: bin, args: [...args, prompt], shell: false, stdin: null };
+  return { command: bin, args: args.map((a) => (a === "" ? '""' : a)), shell: true, stdin: prompt };
 }
 
 export function canonical(obj) {

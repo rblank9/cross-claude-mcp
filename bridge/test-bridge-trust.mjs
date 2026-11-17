@@ -7,11 +7,11 @@ import { spawn, spawnSync } from "child_process";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync } from "fs";
-import { tmpdir } from "os";
+import { tmpdir, homedir } from "os";
 import crypto from "crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { signEnvelope, parseEnvelope, canonical, sha8, REASONS, loadTrusted, verifyEnvelope, createNonceStore, teamDenyReason, setTeamMarker, teamMarkerPath, recordDrop, teamChannelsOf } from "./trust.mjs";
+import { signEnvelope, parseEnvelope, canonical, sha8, REASONS, loadTrusted, verifyEnvelope, createNonceStore, teamDenyReason, setTeamMarker, teamMarkerPath, recordDrop, teamChannelsOf, resolveHome, resolveSessionPid, courierInvocation, parseWinProcessTable, windowsProcessTable } from "./trust.mjs";
 import { deliveryHeader } from "./cross-claude-bridge.mjs";
 import { statSync } from "fs";
 
@@ -443,6 +443,63 @@ async function runTeammateUnit() {
   }
 }
 
+// ---- win32 compatibility (unit level: pure functions with injected platform, lister, and session check) ----
+function runWin32Unit() {
+  console.log("0b. win32 compatibility (unit)");
+  // Home: HOME is ignored on win32 (Git Bash exports /c/Users/x); macOS/Linux keep HOME-first.
+  check(resolveHome(undefined, { HOME: "/c/Users/teammate" }, "win32") === homedir(), "win32 home: os.homedir() wins over a Git Bash HOME");
+  check(resolveHome("/explicit", { HOME: "/x" }, "win32") === "/explicit", "explicit home argument wins on win32");
+  check(resolveHome(undefined, { HOME: "/Users/r" }, "darwin") === "/Users/r", "darwin home: HOME still wins (unchanged)");
+  check(resolveHome(undefined, {}, "darwin") === homedir(), "darwin home: falls back to os.homedir() when HOME is unset");
+
+  // Process table parsing: PowerShell emits one object for a single row, an array otherwise.
+  const arr = parseWinProcessTable('[{"ProcessId":10,"ParentProcessId":4},{"ProcessId":11,"ParentProcessId":10}]');
+  check(arr.get(10) === 4 && arr.get(11) === 10 && arr.size === 2, "process table: array form parsed");
+  const one = parseWinProcessTable('{"ProcessId":7,"ParentProcessId":3}');
+  check(one.get(7) === 3 && one.size === 1, "process table: single-object form parsed");
+  check(parseWinProcessTable("").size === 0 && parseWinProcessTable("not json").size === 0, "process table: empty or garbage yields an empty map");
+  check(!parseWinProcessTable('[{"ProcessId":0,"ParentProcessId":0}]').has(0), "process table: pid 0 dropped");
+  check(windowsProcessTable(() => { throw new Error("no powershell"); }).size === 0, "process table: lister failure yields an empty map (fallback)");
+  check(windowsProcessTable(() => '[{"ProcessId":9,"ParentProcessId":2}]').get(9) === 2, "process table: lister output parsed through windowsProcessTable");
+
+  // Session pid: off win32 nothing is probed; on win32 walk up past a shell to the Claude pid.
+  let probes = 0;
+  let listed = 0;
+  const hasAt = (set) => (pid) => { probes++; return set.has(pid); };
+  const lister = (table) => () => { listed++; return new Map(Object.entries(table).map(([k, v]) => [Number(k), v])); };
+  const darwinOut = resolveSessionPid(300, { platform: "darwin", hasSession: hasAt(new Set([77])), listProcesses: lister({ 300: 77 }) });
+  check(darwinOut === 300 && probes === 0 && listed === 0, "darwin: returns process.ppid unchanged, probes nothing");
+  probes = 0; listed = 0;
+  const direct = resolveSessionPid(77, { platform: "win32", hasSession: hasAt(new Set([77])), listProcesses: lister({}) });
+  check(direct === 77 && listed === 0, "win32 direct parent is Claude: no process listing needed");
+  probes = 0; listed = 0;
+  // MCP child 200 -> cmd.exe 150 -> claude 77 (has a sessions file).
+  const viaShell = resolveSessionPid(200, { platform: "win32", hasSession: hasAt(new Set([77])), listProcesses: lister({ 200: 150, 150: 77, 77: 1 }) });
+  check(viaShell === 77, "win32 MCP child under cmd.exe: walks up to the Claude pid");
+  probes = 0; listed = 0;
+  const none = resolveSessionPid(200, { platform: "win32", hasSession: hasAt(new Set()), listProcesses: lister({ 200: 150, 150: 77 }) });
+  check(none === 200, "win32 no session in the ancestry: falls back to the direct ppid");
+  const cyc = resolveSessionPid(5, { platform: "win32", hasSession: hasAt(new Set()), listProcesses: lister({ 5: 6, 6: 5 }) });
+  check(cyc === 5, "win32 parent cycle terminates and falls back");
+  const chain = {};
+  for (let i = 1; i < 12; i++) chain[i] = i + 1;
+  const capped = resolveSessionPid(1, { platform: "win32", hasSession: hasAt(new Set([12])), listProcesses: lister(chain), maxHops: 8 });
+  check(capped === 1, "win32 walk stops at maxHops (session 11 hops up is not reached)");
+  const emptyTable = resolveSessionPid(200, { platform: "win32", hasSession: hasAt(new Set([77])), listProcesses: () => new Map() });
+  check(emptyTable === 200, "win32 with an empty process table: falls back to the direct ppid");
+
+  // Courier spawn: off win32 the original argv (prompt last, no shell); on win32 static argv, prompt on stdin.
+  const flags = ["-p", "--setting-sources", ""];
+  const evil = "hi & del C:\\x && calc \"quoted\" | rd";
+  const mac = courierInvocation({ bin: "claude", args: flags, prompt: evil, platform: "darwin" });
+  check(mac.shell === false && mac.stdin === null && mac.command === "claude" && mac.args.length === 4 && mac.args[3] === evil && mac.args[2] === "", "darwin courier: original argv, prompt last, no shell, no stdin");
+  const win = courierInvocation({ bin: "claude", args: flags, prompt: evil, platform: "win32" });
+  check(win.shell === true && win.stdin === evil, "win32 courier: shell on, prompt goes on stdin");
+  check(!win.args.join(" ").includes("calc") && win.args.length === 3, "win32 courier: message text never reaches the shell command line");
+  check(win.args[2] === '""', "win32 courier: empty argument is quoted so cmd.exe keeps it");
+  check(courierInvocation({ bin: "C:\\Tools\\claude.cmd", args: flags, prompt: "p", platform: "win32" }).command === "C:\\Tools\\claude.cmd", "win32 courier: BRIDGE_COURIER_BIN override is honored");
+}
+
 const guard = setTimeout(() => {
   console.log("FAIL: overall 240 s guard hit");
   process.exit(1);
@@ -450,6 +507,7 @@ const guard = setTimeout(() => {
 
 try {
   await runTeammateUnit();
+  runWin32Unit();
   await runTests();
 } catch (err) {
   failed++;
