@@ -114,7 +114,8 @@ async function main() {
 
   console.log("3. positive control: neutral cwd, no token");
   const c3 = await runCase({ cwd: dirs["neutral-b"] });
-  assert(!c3.text.includes("Refused") && c3.text.includes("Live push ON"), `listen_live accepted (got: ${c3.text.slice(0, 80)})`);
+  // Server unreachable here, so the bridge cannot confirm scope: accepted, but honestly "NOT yet confirmed".
+  assert(!c3.text.includes("Refused") && c3.text.includes("Live push requested"), `listen_live accepted (got: ${c3.text.slice(0, 80)})`);
   assert(c3.markerExists, "team-listening marker written");
   assert(!teamDenied(c3.auditLines), "no team_denied in audit");
 

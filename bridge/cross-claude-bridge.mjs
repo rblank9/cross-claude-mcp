@@ -30,7 +30,7 @@ import {
 // as notifications/claude/channel. Reconnects with backoff and resumes from a cursor.
 // Gates 2-5 (docs/plans/bridge-trust.md): only messages signed by a trusted identity are delivered.
 
-const VERSION = "0.5.0";
+const VERSION = "0.5.1";
 const BODY_CAP = 65536;
 const DEFAULT_URL = "https://cross-claude-mcp-production.up.railway.app";
 const AUTH_HEADER = "Authorization";
@@ -260,11 +260,46 @@ async function main() {
     if (init.body) h["Content-Type"] = "application/json";
     const res = await fetch(`${BASE}${p}`, { ...init, headers: h });
     if (!res.ok) {
-      const err = new Error(`HTTP ${res.status}`);
+      const body = await res.json().catch(() => null);
+      const err = new Error(`HTTP ${res.status}${body?.error ? ` ${body.error}` : ""}`);
       err.status = res.status;
+      err.code = body?.error ?? null;
       throw err;
     }
     return res.json();
+  };
+
+  // Server-side scope (Gate 6): a scoped teammate key gets 403 for a channel outside its scope, and
+  // /api/stream 403s the WHOLE stream if any one channel is out of scope. So a channel is checked
+  // with the server before it joins the set, and any channel the server refuses is dropped and
+  // reported (delivery_status), never retried: retrying it kills live push for every channel.
+  const refused = new Map(); // channel -> "<code> at <iso time>"
+  const probeScope = async (ch) => {
+    try {
+      await api(`/api/messages/${encodeURIComponent(ch)}?limit=1`);
+      return { ok: true };
+    } catch (e) {
+      if (e.status === 403) return { ok: false, refused: true, code: e.code || "forbidden" };
+      return { ok: false, refused: false, error: e.message };
+    }
+  };
+  const refuseChannel = (ch, code) => {
+    channels.delete(ch);
+    refused.set(ch, `${code || "forbidden"} at ${new Date().toISOString()}`);
+    log(`server refused #${ch} (403 ${code || "forbidden"}); dropped from the live set`);
+    syncTeamMarker();
+  };
+  // After a 403 on /api/stream: find and drop the refused channels. Returns the dropped names.
+  const pruneRefused = async () => {
+    const dropped = [];
+    for (const ch of [...channels]) {
+      const p = await probeScope(ch);
+      if (p.refused) {
+        refuseChannel(ch, p.code);
+        dropped.push(ch);
+      }
+    }
+    return dropped;
   };
 
   const deliver = (m) => {
@@ -405,8 +440,15 @@ async function main() {
   const initCursor = async () => {
     try {
       let max = 0;
-      for (const ch of channels) {
-        const data = await api(`/api/messages/${encodeURIComponent(ch)}?limit=1`);
+      for (const ch of [...channels]) {
+        let data;
+        try {
+          data = await api(`/api/messages/${encodeURIComponent(ch)}?limit=1`);
+        } catch (e) {
+          if (e.status !== 403) throw e;
+          refuseChannel(ch, e.code);
+          continue;
+        }
         max = Math.max(max, Number(data.last_id ?? 0));
       }
       cursor = max;
@@ -465,6 +507,10 @@ async function main() {
         const data = await api(`/api/messages/${encodeURIComponent(ch)}?${qs}`);
         batch.push(...(data.messages || []));
       } catch (e) {
+        if (e.status === 403) {
+          refuseChannel(ch, e.code);
+          continue;
+        }
         failed = true;
         lastError = e.message;
         if (e.status === 503) killedHit = true;
@@ -516,6 +562,16 @@ async function main() {
           drop("killed", {});
           throw new Error("server killed (503)");
         }
+      }
+      if (res.status === 403) {
+        const j = await res.json().catch(() => null);
+        const dropped = await pruneRefused();
+        if (myGen !== gen) return;
+        if (dropped.length) backoff = 1000;
+        throw new Error(
+          `HTTP 403 ${j?.error ?? "forbidden"}` +
+            (dropped.length ? `; dropped out-of-scope #${dropped.join(", #")}` : "; no single channel refused on re-check")
+        );
       }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       serverKilled = false;
@@ -675,9 +731,23 @@ async function main() {
       if (channels.has(ch)) {
         return textResult(`Already live-listening on #${ch}. New messages are pushed into this session as they arrive.`);
       }
+      const probe = await probeScope(ch);
+      if (probe.refused) {
+        refused.set(ch, `${probe.code} at ${new Date().toISOString()}`);
+        log(`listen_live #${ch} refused by server (403 ${probe.code})`);
+        return textResult(
+          `Refused: the server says #${ch} is out of scope for this key (403 ${probe.code}). NOT listening on #${ch}. Live push on your other channels is unaffected.`
+        );
+      }
+      refused.delete(ch);
       channels.add(ch);
       syncTeamMarker();
       connectNow();
+      if (!probe.ok) {
+        return textResult(
+          `Live push requested for #${ch}, NOT yet confirmed: the server could not be reached to check it (${probe.error}). The bridge keeps retrying; call delivery_status and look for "connected: true" before relying on it.`
+        );
+      }
       return textResult(
         `🔔 Live push ON for #${ch} (from message id ${cursor}). New messages will be injected into this session as they arrive — you are genuinely listening, even while idle. Call stop_listening to turn it off.`
       );
@@ -730,7 +800,10 @@ async function main() {
             ? ` (courier ok: ${couriered}, failed: ${courierFailures}, queued: ${courierQueue.length}${courierLastError ? `, last error: ${courierLastError}` : ""})`
             : "") +
           `\n` +
-          `channels:\n${chanLines}\n\n` +
+          `channels:\n${chanLines}\n` +
+          `refused by server (403, NOT listening):\n${
+            [...refused].sort().map(([c, why]) => `  - #${c} (${why})`).join("\n") || "  (none)"
+          }\n\n` +
           `• Live push ON = new messages are injected into this session as they arrive, even while idle.\n` +
           `• Any channel NOT listed above is poll-only from this session: you see its messages only when you call check_messages, or while blocked inside wait_for_reply.`
       );

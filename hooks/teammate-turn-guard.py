@@ -482,12 +482,12 @@ def log_failopen(path, err_name):
         pass
 
 
-def emit_failopen(path, err_name):
+def emit_failopen(path, err_name, what="the session transcript"):
     """Allow the call (no hookSpecificOutput, so no permissionDecision) but show the user a
     systemMessage: a top-level universal field that Claude Code displays on exit 0."""
     log_failopen(path, err_name)
     print(json.dumps({"systemMessage": (
-        f"teammate-turn-guard could not read the session transcript ({err_name}). "
+        f"teammate-turn-guard could not read {what} ({err_name}). "
         "The teammate guard is NOT protecting this turn. Logged to ~/.config/cross-claude/guard-failopen.log"
     )}))
 
@@ -503,13 +503,14 @@ def emit_deny(rule):
 def main():
     try:
         payload = json.loads(sys.stdin.read())
-    except ValueError:
+        if not isinstance(payload, dict):
+            raise ValueError(f"hook input is {type(payload).__name__}, not an object")
+    except (OSError, ValueError) as e:
         if team_listening(None):
             emit_deny("unreadable hook input while team-listening")
             return 0
-        sys.stderr.write("teammate-turn-guard: unreadable hook input; allowing, session not team-listening\n")
-        return 0
-    if not isinstance(payload, dict):
+        sys.stderr.write(f"teammate-turn-guard: unreadable hook input ({type(e).__name__}); allowing, session not team-listening\n")
+        emit_failopen("<stdin>", type(e).__name__, what="its hook input")
         return 0
     tool = str(payload.get("tool_name") or "")
     tin = payload.get("tool_input")

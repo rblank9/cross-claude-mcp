@@ -398,11 +398,44 @@ def test_unreadable_stdin_marker_present_denies(env_setup, tmp_path):
     assert is_deny(out)
 
 
-def test_unreadable_stdin_not_listening_allows_with_warning(env_setup, tmp_path):
+def stdin_failopen_lines(env):
+    with open(os.path.join(env["HOME"], ".config", "cross-claude", "guard-failopen.log"), encoding="utf-8") as f:
+        return [ln.split("\t") for ln in f.read().splitlines()]
+
+
+def test_unreadable_stdin_not_listening_allows_with_alarm(env_setup, tmp_path):
+    # Silent fail-open is the bug (SG condition 2026-11-17): allow, but systemMessage + log line.
     env = dict(env_setup["env"], HOME=str(tmp_path / "home"))
     out, err = run_raw(env, "{not json")
-    assert out == ""
+    assert failopen_alarm(out)
+    assert "hook input" in json.loads(out)["systemMessage"]
     assert "unreadable" in err
+    [(_, path, cls)] = stdin_failopen_lines(env)
+    assert (path, cls) == ("<stdin>", "JSONDecodeError")
+
+
+@pytest.mark.parametrize("raw", ["[]", "null", '"x"', "42"])
+def test_non_object_stdin_not_listening_allows_with_alarm(env_setup, tmp_path, raw):
+    env = dict(env_setup["env"], HOME=str(tmp_path / "home"))
+    out, _ = run_raw(env, raw)
+    assert failopen_alarm(out)
+    [(_, path, cls)] = stdin_failopen_lines(env)
+    assert (path, cls) == ("<stdin>", "ValueError")
+
+
+def test_non_object_stdin_team_listening_denies(env_setup, tmp_path):
+    env = dict(env_setup["env"], CROSS_CLAUDE_TEAM_LISTENING="1")
+    out, _ = run_raw(env, "[]")
+    assert is_deny(out)
+
+
+def test_non_utf8_stdin_not_listening_allows_with_alarm(env_setup, tmp_path):
+    env = dict(env_setup["env"], HOME=str(tmp_path / "home"), PYTHONIOENCODING="utf-8")
+    proc = subprocess.run([sys.executable, HOOK], input=b"\xff\xfe{bad", capture_output=True, env=env, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert failopen_alarm(proc.stdout.decode().strip())
+    [(_, path, cls)] = stdin_failopen_lines(env)
+    assert (path, cls) == ("<stdin>", "UnicodeDecodeError")
 
 
 # --- security-guard widenings (2026-11-03) ----------------------------------
