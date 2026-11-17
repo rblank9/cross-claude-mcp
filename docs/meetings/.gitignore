@@ -1,0 +1,7 @@
+# written by meeting-aide: call transcripts and audio stay out of git
+transcript.md
+*.wav
+events.jsonl
+ledger.json
+.run/
+screen/

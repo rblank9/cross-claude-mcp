@@ -1,0 +1,26 @@
+*Cross-claude bridge onboarding, R + Vicky, Nov 17 2026*
+
+R and Vicky got Vicky's Claude Code on Windows connected to the new cross-claude bridge, with Claude guiding each step and security-guard checking the trust side. The old shared-key connection was removed. Vicky got his own key, locked down on disk and registered on the server for team-syb only. His hello message arrived and was verified as signed by him. The server correctly blocked his attempt to read another channel. The bridge falsely reported that attempt as a success, and R deferred that fix until after the call. Steph and Santi wait for the fix.
+
+*Decisions*
+• Security-guard may create a teammate's 1Password key note and share it, instead of the teammate doing it.
+• Vicky stays connected, limited to team-syb.
+• The bridge out-of-scope bug gets fixed after the call. Steph and Santi are not connected until it is fixed.
+• Ad changes are on hold for the next two weeks.
+
+*Action items*
+*Claude*
+• Fix the bridge so listen_live refuses channels outside the teammate's scope and reports a 403 as an error
+• Finish the guard follow-ups security-guard asked for, then send the final version to security-guard
+*Security-guard*
+• Update the copy of the guard in claude-optimization once the guard fix is approved
+*Vicky*
+• Switch to the final version, then check /hooks and a debug run
+*R*
+• Give Vicky access to the Ads Expert dashboard
+• Consolidate the ads tools into one shared agent over the next two weeks
+• Connect Steph and Santi using docs/teammate-live-session-mac.md once the bug is fixed
+
+*Open questions*
+• Should one of R's sessions run a bridge all the time, so teammate messages arrive live?
+• Santi's bridge has been silent since 11-05. Is his local setup still intact?

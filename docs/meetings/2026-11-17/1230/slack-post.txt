@@ -1,0 +1,22 @@
+*Cross-claude bridge onboarding, R + Santi, Nov 17 2026*
+
+R and Santi connected Santi's Mac to the cross-claude bridge on a live call, with security-guard checking the trust side. Santi's existing key was verified by hash, his clone was moved to the 5c86cd5 fix, and R's Claudes were trusted on team-syb only. The guard was proven to deny credential tools in teammate turns. His hello reached team-syb with a verified signature, and the server refused #general as designed. The call exposed that the bridge bug is worse than cosmetic: a refused channel blocks all live push until it is stopped.
+
+*Decisions*
+• Santi keeps his existing santi-mac key. No re-init and no KEYS change.
+• Santi stays pinned to 5c86cd5 until the listen_live fix ships.
+
+*Action items*
+*Claude*
+• Fix the bridge so a channel refused with 403 is dropped and reported, not retried while claiming Live push ON.
+• Re-pin Santi to the fixed SHA once it ships.
+*Someone*
+• Fix Santi's old Bash credential hook so it returns a valid decision.
+• Review the 2 moderate npm advisories on the 5c86cd5 lockfile.
+*R*
+• Reconnect SYB data for Santi, soon.
+*Santi*
+• Put test plan feedback on the ticket.
+
+*Open questions*
+• No R bridge is running, so a live round trip to R's sessions is still untested.
