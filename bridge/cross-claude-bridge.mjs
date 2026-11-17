@@ -182,12 +182,18 @@ async function main() {
   let courierFailures = 0;
   let courierLastError = "";
 
+  // Instance ids (SG A3, 2026-11-17): deterministic so the audit stays readable.
+  //   named session   -> <name>-<host>
+  //   unnamed session -> <project>-<login>-<host>, plus -2..-9 only when another live session already holds it
+  //   (pickInstanceId). <login> is the Claude config dir: claude, claude-account2, claude-account3.
+  const LOGIN = slug(path.basename(process.env.CLAUDE_CONFIG_DIR || path.join(home, ".claude"))) || "claude";
+  const SESSION_TAG = `[session ${sessionId || sessionPid}]`;
   const computeIdentity = () => {
     if (FIXED_ID) return { key: FIXED_ID, name: null, instanceId: FIXED_ID };
     const name = sessionNameFor(home, sessionPid);
     const instanceId = name
       ? `${slug(name)}-${SHORT_HOST}`
-      : `${slug(path.basename(process.cwd()))}-${sessionPid}-${SHORT_HOST}`;
+      : `${slug(path.basename(process.cwd()))}-${LOGIN}-${SHORT_HOST}`;
     return { key: name || "", name, instanceId };
   };
 
@@ -624,7 +630,7 @@ async function main() {
         method: "POST",
         body: JSON.stringify({
           instance_id: instanceId,
-          description: `Claude Code session "${sessionName || instanceId}" on ${HOST} (cwd ${process.cwd()}), bridge v${VERSION}`,
+          description: `Claude Code session "${sessionName || instanceId}" on ${HOST} (cwd ${process.cwd()}), bridge v${VERSION} ${SESSION_TAG}`,
         }),
       });
     } catch (e) {
@@ -645,11 +651,31 @@ async function main() {
     connectNow();
   };
 
-  const refreshIdentity = () => {
+  // First of base, base-2 .. base-9 that is free: unknown, offline, or already this session's (SESSION_TAG in its
+  // description, e.g. a bridge restart). Server unreachable -> base. All nine taken -> base-<pid>.
+  const pickInstanceId = async (base) => {
+    let rows;
+    try {
+      rows = (await api("/api/instances")).instances || [];
+    } catch (e) {
+      log(`instance id check skipped (${e.message}); using ${base}`);
+      return base;
+    }
+    const byId = new Map(rows.map((r) => [r.instance_id, r]));
+    for (let n = 1; n <= 9; n++) {
+      const id = n === 1 ? base : `${base}-${n}`;
+      const r = byId.get(id);
+      if (!r || r.status !== "online" || String(r.description || "").includes(SESSION_TAG)) return id;
+    }
+    return `${base}-${sessionPid}`;
+  };
+
+  const refreshIdentity = async () => {
     if (FIXED_ID) return;
     const next = computeIdentity();
     if (next.key === identityKey) return;
     identityKey = next.key;
+    if (!next.name) next.instanceId = await pickInstanceId(next.instanceId);
     applyIdentity(next);
   };
 
@@ -831,6 +857,15 @@ async function main() {
   process.stdin.on("close", shutdown);
   for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, shutdown);
 
+  if (!FIXED_ID && !sessionName) {
+    const picked = await pickInstanceId(instanceId);
+    if (picked !== instanceId) {
+      channels.delete(inbox);
+      instanceId = picked;
+      inbox = `dm-${instanceId}`;
+      if (!NO_INBOX) channels.add(inbox);
+    }
+  }
   log(`starting v${VERSION} as ${instanceId} (inbox dm-${instanceId}) against ${BASE}`);
   const trustedCount = Object.keys(loadTrusted()).length;
   aud("start", { reason: "ok", trusted_count: trustedCount, delivery: DELIVERY, version: VERSION });
@@ -846,7 +881,7 @@ async function main() {
       ctl.abort();
     }
   }, 5000);
-  if (!FIXED_ID) identityTimer = setInterval(refreshIdentity, IDENTITY_MS);
+  if (!FIXED_ID) identityTimer = setInterval(() => void refreshIdentity().catch((e) => log(`identity refresh failed: ${e.message}`)), IDENTITY_MS);
   registerTimer = setInterval(() => void register(), REGISTER_MS);
   connectNow();
 }

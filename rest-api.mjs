@@ -127,6 +127,9 @@ export function createRestRouter(db) {
         if (!scopeSendAllowed(req.keyId)) return scopeRefuse(req, res, "rate_limited", 429);
       }
       // team-* rooms (SG 2026-11-17): at most TEAM_ROOM_CAP server-wide; the first post to a new room is logged.
+      // Accepted caveats (SG): (1) the MCP create_channel tool (tools.mjs) is not capped; scoped teammate keys can
+      // never reach /mcp, so only R's unscoped keys can create rooms there. (2) Two concurrent first-posts to
+      // different new rooms can both pass the count check, so the cap can overshoot by one.
       if (isTeamRoom(normalized)) {
         const names = (await db.listChannels()).map((c) => c.name);
         if (!names.includes(normalized)) {
