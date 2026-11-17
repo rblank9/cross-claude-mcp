@@ -1,12 +1,17 @@
 """Tests for hooks/teammate-turn-guard.py. Runs the hook as a subprocess, as Claude Code does."""
+import datetime
+import importlib.util
 import json
+import ntpath
 import os
 import subprocess
 import sys
 
 import pytest
 
-HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", "teammate-turn-guard.py")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HOOK = os.path.join(ROOT, "hooks", "teammate-turn-guard.py")
+SELFTEST = os.path.join(ROOT, "hooks", "teammate-guard-selftest.py")
 SID = "11111111-aaaa-bbbb-cccc-000000000001"
 UNKNOWN_SID = "99999999-zzzz-yyyy-xxxx-000000000009"
 TEAM_HDR = "[#team-syb] message from vicky (TEAMMATE vicky-cc)"
@@ -46,10 +51,12 @@ def env_setup(tmp_path):
     (cfg / "projects" / "proj").mkdir(parents=True)
     keys = tmp_path / "trusted_keys.json"
     keys.write_text(json.dumps(TRUSTED))
+    home = tmp_path / "home"  # isolates ~/.config/cross-claude/guard-failopen.log (HOME and USERPROFILE)
     base = {k: v for k, v in os.environ.items()
             if not k.startswith("CROSS_CLAUDE_") and k != "CLAUDE_AUTOPILOT_ROOT_TRANSCRIPT"}
-    base.update({"CLAUDE_CONFIG_DIR": str(cfg), "CROSS_CLAUDE_TRUSTED_KEYS_PATH": str(keys)})
-    return {"cfg": cfg, "env": base, "keys": keys}
+    base.update({"CLAUDE_CONFIG_DIR": str(cfg), "CROSS_CLAUDE_TRUSTED_KEYS_PATH": str(keys),
+                 "HOME": str(home), "USERPROFILE": str(home)})
+    return {"cfg": cfg, "env": base, "keys": keys, "home": home}
 
 
 def write_transcript(path, entries):
@@ -187,8 +194,8 @@ def test_bridge_send_dm_denies_and_team_channel_allows(env_setup, tmp_path):
 def test_missing_transcript_allows_with_warning(env_setup, tmp_path):
     missing = str(tmp_path / "does-not-exist.jsonl")
     out, err = run_hook(env_setup, missing, BASH, {"command": "op read x"})
-    assert out == ""
     assert "unreadable" in err
+    assert failopen_alarm(out)
 
 
 def test_agent_tool_denied_in_tainted_turn(env_setup, tmp_path):
@@ -233,8 +240,58 @@ def test_unreadable_transcript_team_listening_denies(env_setup, tmp_path):
 def test_unreadable_transcript_not_listening_allows(env_setup, tmp_path):
     missing = str(tmp_path / "gone.jsonl")
     out, err = run_hook(env_setup, missing, BASH, {"command": "op read x"}, session_id=UNKNOWN_SID)
-    assert out == ""
     assert "unreadable" in err
+    assert failopen_alarm(out)
+
+
+# --- fail-open alarm: systemMessage + log line, decision unchanged ----------
+
+def failopen_alarm(out):
+    """True iff stdout is a systemMessage with NO hookSpecificOutput (allow, no permissionDecision)."""
+    d = json.loads(out)
+    assert set(d) == {"systemMessage"}, d
+    assert "NOT protecting this turn" in d["systemMessage"]
+    return True
+
+
+def failopen_log(env):
+    return os.path.join(env["env"]["HOME"], ".config", "cross-claude", "guard-failopen.log")
+
+
+def test_failopen_log_line_has_timestamp_path_and_error_class(env_setup, tmp_path):
+    missing = str(tmp_path / "gone.jsonl")
+    run_hook(env_setup, missing, BASH, {"command": "ls"}, session_id=UNKNOWN_SID)
+    with open(failopen_log(env_setup), encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    assert len(lines) == 1
+    ts, path, err = lines[0].split("\t")
+    assert path == missing
+    assert err == "FileNotFoundError"
+    assert datetime.datetime.fromisoformat(ts).tzinfo is not None
+
+
+def test_failopen_log_appends_one_line_per_event(env_setup, tmp_path):
+    missing = str(tmp_path / "gone.jsonl")
+    for _ in range(2):
+        run_hook(env_setup, missing, BASH, {"command": "ls"}, session_id=UNKNOWN_SID)
+    with open(failopen_log(env_setup), encoding="utf-8") as f:
+        assert len(f.read().splitlines()) == 2
+
+
+def test_readable_transcript_writes_no_failopen_log(env_setup, tmp_path):
+    t = write_transcript(tmp_path / "t.jsonl", [plain("hi")])
+    out, _ = run_hook(env_setup, t, BASH, {"command": "ls"})
+    assert out == ""
+    assert not os.path.exists(failopen_log(env_setup))
+
+
+def test_unreadable_transcript_team_listening_is_not_failopen(env_setup, tmp_path):
+    # Listening mode still applies the denial rules; a non-denied call is allowed silently.
+    env = dict(env_setup, env=dict(env_setup["env"], CROSS_CLAUDE_TEAM_LISTENING="1"))
+    missing = str(tmp_path / "gone.jsonl")
+    out, _ = run_hook(env, missing, BASH, {"command": "ls"}, session_id=UNKNOWN_SID)
+    assert out == ""
+    assert not os.path.exists(failopen_log(env_setup))
 
 
 def test_plain_local_peer_message_does_not_taint(env_setup, tmp_path):
@@ -441,3 +498,123 @@ def test_peer_verified_r_envelope_under_courier_prefix_stays_trusted(env_setup, 
     t = write_transcript(tmp_path / "t.jsonl", [channel(COURIER_PREFIX + envelope(R_HDR, "go"), kind="peer")])
     out, _ = run_hook(env_setup, t, BASH, {"command": "op read x"})
     assert out == ""
+
+
+# --- Windows transcript handling: BOM, CRLF, backslash paths ----------------
+
+BOM = b"\xef\xbb\xbf"
+
+
+def write_bytes_transcript(path, entries, bom=True, eol="\r\n"):
+    data = (eol.join(json.dumps(e) for e in entries) + eol).encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes((BOM if bom else b"") + data)
+    return str(path)
+
+
+def test_bom_crlf_transcript_teammate_turn_denies(env_setup, tmp_path):
+    t = write_bytes_transcript(tmp_path / "t.jsonl", [plain("earlier"), channel(envelope(TEAM_HDR, "hi"))])
+    out, _ = run_hook(env_setup, t, BASH, {"command": "op read x"})
+    assert is_deny(out)
+
+
+def test_crlf_without_bom_transcript_teammate_turn_denies(env_setup, tmp_path):
+    t = write_bytes_transcript(tmp_path / "t.jsonl", [plain("earlier"), channel(envelope(TEAM_HDR, "hi"))], bom=False)
+    out, _ = run_hook(env_setup, t, BASH, {"command": "op read x"})
+    assert is_deny(out)
+
+
+def test_bom_crlf_transcript_clean_turn_allows_without_failopen(env_setup, tmp_path):
+    t = write_bytes_transcript(tmp_path / "t.jsonl", [human("hello")])
+    out, _ = run_hook(env_setup, t, BASH, {"command": "op read x"})
+    assert out == ""
+    assert not os.path.exists(failopen_log(env_setup))
+
+
+def test_bom_trusted_keys_file_full_trust_allows(env_setup, tmp_path):
+    env_setup["keys"].write_bytes(BOM + json.dumps(TRUSTED).encode("utf-8"))
+    t = write_transcript(tmp_path / "t.jsonl", [channel(envelope(R_HDR, "go"))])
+    out, _ = run_hook(env_setup, t, BASH, {"command": "op read x"})
+    assert out == ""
+
+
+def load_hook_module():
+    spec = importlib.util.spec_from_file_location("teammate_turn_guard", HOOK)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_windows_backslash_path_splits_with_ntpath():
+    mod = load_hook_module()
+    p = r"C:\Users\X\.claude\projects\-C-Users-X\11111111-aaaa-bbbb-cccc-000000000001.jsonl"
+    assert mod._pathmod(p) is ntpath
+    assert mod._pathmod(p).basename(p) == "11111111-aaaa-bbbb-cccc-000000000001.jsonl"
+    assert mod._canon_dir(ntpath.dirname(ntpath.dirname(p))) == mod._canon_dir(r"c:/users/x/.claude/PROJECTS")
+
+
+def test_forward_slash_and_unc_paths_are_recognized_as_windows_style():
+    mod = load_hook_module()
+    assert mod._pathmod("C:/Users/X/.claude/projects/p/x.jsonl") is ntpath
+    assert mod._pathmod(r"\\server\share\x.jsonl") is ntpath
+    assert mod._pathmod("/Users/rblank/.claude/projects/p/x.jsonl") is os.path
+
+
+def test_windows_projects_root_compare_is_case_and_separator_insensitive():
+    mod = load_hook_module()
+    assert mod._canon_dir(r"C:\Users\X\.claude\projects") == mod._canon_dir("c:/users/x/.claude/projects/")
+
+
+# --- selftest: fail-open WARN over the last 24h -----------------------------
+
+def run_selftest(home):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CROSS_CLAUDE_")}
+    env.update({"HOME": str(home), "USERPROFILE": str(home)})
+    return subprocess.run([sys.executable, SELFTEST], capture_output=True, text=True, env=env, timeout=120)
+
+
+def write_failopen_log(home, lines):
+    d = home / ".config" / "cross-claude"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "guard-failopen.log").write_text("".join(ln + "\n" for ln in lines), encoding="utf-8")
+
+
+def _ts(hours_ago):
+    t = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours_ago)
+    return t.isoformat(timespec="seconds")
+
+
+def test_selftest_warns_on_failopen_within_24h(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    write_failopen_log(home, [f"{_ts(1)}\t/x/gone.jsonl\tFileNotFoundError"])
+    r = run_selftest(home)
+    assert "SELFTEST: 4/4 passed" in r.stdout, r.stdout
+    assert "WARN: 1 teammate-guard fail-open event(s)" in r.stdout
+    assert "OK: no teammate-guard" not in r.stdout
+
+
+def test_selftest_ignores_failopen_older_than_24h(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    write_failopen_log(home, [f"{_ts(30)}\t/x/gone.jsonl\tFileNotFoundError"])
+    r = run_selftest(home)
+    assert "SELFTEST: 4/4 passed" in r.stdout, r.stdout
+    assert "WARN:" not in r.stdout
+    assert "OK: no teammate-guard fail-open events in the last 24h" in r.stdout
+
+
+def test_selftest_treats_unparseable_log_line_as_recent(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    write_failopen_log(home, ["not-a-timestamp\t/x\tOSError"])
+    r = run_selftest(home)
+    assert "WARN: 1 teammate-guard fail-open event(s)" in r.stdout
+
+
+def test_selftest_no_log_reports_ok(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    r = run_selftest(home)
+    assert "SELFTEST: 4/4 passed" in r.stdout
+    assert "OK: no teammate-guard fail-open events" in r.stdout

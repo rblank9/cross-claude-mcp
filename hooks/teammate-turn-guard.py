@@ -14,8 +14,10 @@ Helpers marked "copied from autopilot.py" mirror
 /Users/rblank/Projects/claude-optimization/hooks/lib/autopilot.py and are
 copied, not imported, so this repo stays standalone.
 """
+import datetime
 import glob
 import json
+import ntpath
 import os
 import re
 import shlex
@@ -44,6 +46,8 @@ PIPE_SHELL_RE = re.compile(r"\|&?\s*(?:[^\s|;&]*/)?(?:sh|bash|zsh|dash)(?=\s|$|;
 SUBST_RE = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
 SUBST_LAUNCH_RE = re.compile(r"\b(?:which|command\s+-v|type\s+-p)\b[^\n]*\b(?:claude|ccx|cc2|ccm|ccc)\b")
 URL_RE = re.compile(r"inbox|cross-claude|crosswi\.re|/api/messages|railway\.app", re.I)
+WIN_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+FAILOPEN_LOG = os.path.join("~", ".config", "cross-claude", "guard-failopen.log")
 
 BASH_DENY = [
     (r"\b(op|with-env|secret-provision|spawn-collaborator|cc-bridge-keys)\b", "credential/spawn tool"),
@@ -73,6 +77,17 @@ def _projects_roots():
     return roots
 
 
+def _pathmod(p):
+    """ntpath for Windows-style paths (drive letter or UNC), so backslash paths split
+    correctly even when this code runs under a POSIX os.path."""
+    return ntpath if WIN_PATH_RE.match(p) else os.path
+
+
+def _canon_dir(p):
+    mod = _pathmod(p)
+    return mod.normcase(mod.normpath(p))
+
+
 def find_session_transcript(session_id):
     try:
         if not isinstance(session_id, str) or not SESSION_ID_RE.match(session_id):
@@ -90,10 +105,11 @@ def is_session_transcript(path):
     try:
         if not isinstance(path, str) or not path.endswith(".jsonl") or not os.path.isfile(path):
             return False
-        if not SESSION_ID_RE.match(os.path.basename(path)[: -len(".jsonl")]):
+        mod = _pathmod(path)
+        if not SESSION_ID_RE.match(mod.basename(path)[: -len(".jsonl")]):
             return False
-        parent = os.path.dirname(os.path.dirname(os.path.realpath(path)))
-        return any(os.path.isdir(r) and os.path.realpath(r) == parent for r in _projects_roots())
+        parent = _canon_dir(mod.dirname(mod.dirname(os.path.realpath(path))))
+        return any(os.path.isdir(r) and _canon_dir(os.path.realpath(r)) == parent for r in _projects_roots())
     except Exception:
         return False
 
@@ -177,7 +193,8 @@ def human_typed_text(entry):
 def read_entries(path):
     if not isinstance(path, str) or not path:
         raise OSError("no transcript path")
-    with open(path, encoding="utf-8", errors="replace") as f:
+    # utf-8-sig strips a leading BOM (Windows writers); splitlines() and json tolerate CRLF.
+    with open(path, encoding="utf-8-sig", errors="replace") as f:
         lines = [ln for ln in f.read().splitlines() if ln.strip()]
     entries = []
     for i, line in enumerate(lines):
@@ -193,7 +210,7 @@ def read_entries(path):
 def trusted_keys():
     path = os.environ.get(ENV_TRUSTED) or os.path.expanduser("~/.config/cross-claude/trusted_keys.json")
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:  # BOM-tolerant: Windows tools write one
             data = json.load(f)
     except Exception:
         return {}
@@ -452,6 +469,29 @@ def denial(tool, tin):
     return None
 
 
+def log_failopen(path, err_name):
+    """Append one tab-separated line: UTC timestamp, transcript path, error class. Never raises."""
+    try:
+        log = os.path.expanduser(FAILOPEN_LOG)
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+        shown = re.sub(r"[\r\n\t]", " ", path) if isinstance(path, str) and path else "<none>"
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(f"{ts}\t{shown}\t{err_name}\n")
+    except Exception:
+        pass
+
+
+def emit_failopen(path, err_name):
+    """Allow the call (no hookSpecificOutput, so no permissionDecision) but show the user a
+    systemMessage: a top-level universal field that Claude Code displays on exit 0."""
+    log_failopen(path, err_name)
+    print(json.dumps({"systemMessage": (
+        f"teammate-turn-guard could not read the session transcript ({err_name}). "
+        "The teammate guard is NOT protecting this turn. Logged to ~/.config/cross-claude/guard-failopen.log"
+    )}))
+
+
 def emit_deny(rule):
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
@@ -487,6 +527,7 @@ def main():
                 emit_deny(rule)
             return 0
         sys.stderr.write(f"teammate-turn-guard: transcript unreadable ({type(e).__name__}); allowing, session not team-listening\n")
+        emit_failopen(path, type(e).__name__)
         return 0
 
     if not taint(entries, trusted_keys()):

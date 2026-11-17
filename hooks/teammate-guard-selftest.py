@@ -6,6 +6,7 @@ dir (never touches real config) and checks the guard denies `op read` in a turn 
 non-full-trust bridge message, and allows it otherwise. Exit 0 only if all 4 cases pass.
 Drafted by gateway/code (delegate code), completed inline after the draft was truncated.
 """
+import datetime
 import json
 import os
 import subprocess
@@ -57,11 +58,37 @@ def run(tmp, name, entries):
     decision = "allow"
     if r.stdout.strip():
         try:
-            if json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny":
+            hso = json.loads(r.stdout).get("hookSpecificOutput") or {}
+            if hso.get("permissionDecision") == "deny":
                 decision = "deny"
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, AttributeError, TypeError):
             decision = "unparseable"
     return decision, r.stderr[:200]
+
+
+def failopen_recent(hours=24):
+    """Log lines from the last `hours` written by the fail-open alarm. A line whose timestamp
+    cannot be parsed counts as recent: an unreadable record must not read as clean."""
+    log = os.path.expanduser(os.path.join("~", ".config", "cross-claude", "guard-failopen.log"))
+    if not os.path.isfile(log):
+        return []
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)
+    recent = []
+    with open(log, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.rstrip("\r\n")
+            if not line.strip():
+                continue
+            try:
+                ts = datetime.datetime.fromisoformat(line.split("\t", 1)[0])
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=datetime.timezone.utc)
+                if ts < cutoff:
+                    continue
+            except ValueError:
+                pass
+            recent.append(line)
+    return recent
 
 
 def main():
@@ -81,6 +108,13 @@ def main():
             else:
                 print(f"FAIL: {name} (expected {expect}, got {got}; stderr: {err})")
     print(f"SELFTEST: {passed}/{len(CASES)} passed")
+    recent = failopen_recent()
+    if recent:
+        print(f"WARN: {len(recent)} teammate-guard fail-open event(s) in the last 24h "
+              f"(the guard could not read a transcript and allowed calls unprotected). Latest: {recent[-1]}")
+        print("WARN: log: " + os.path.expanduser(os.path.join("~", ".config", "cross-claude", "guard-failopen.log")))
+    else:
+        print("OK: no teammate-guard fail-open events in the last 24h")
     return 0 if passed == len(CASES) == 4 else 1
 
 
