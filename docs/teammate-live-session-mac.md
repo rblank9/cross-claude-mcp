@@ -2,7 +2,7 @@
 
 This is the runbook for a live Zoom call where R onboards a Mac teammate with Claude (Kestrel, /listen participant) driving. It was distilled from Vicky's Windows session on 2026-11-17 (notes: docs/meetings/2026-11-17/1115/). docs/teammate-onboarding.md is the underlying procedure. This file is how to run it live.
 
-**Gate:** don't run this until the post-call fix queue is closed: the bridge listen_live scope fix plus the guard follow-ups (memory `post-call-fix-queue-2026-11-17`). Pin the teammate to the SHA that contains those fixes. Call it `<PIN>` below, and fill it in from `git rev-parse origin/main` once security-guard has approved it.
+**Gate: CLEARED 2026-11-17.** The listen_live scope fix and the guard follow-ups shipped in 4191caf (bridge v0.5.1), and security-guard approved it as the re-pin SHA. `<PIN>` below = `4191caf432563e47bc880a54c854bf4f63b97695` unless a later SHA is SG-approved. Re-pin evidence SG wants per teammate: `git rev-parse HEAD` = `<PIN>`, `SELFTEST: 4/4 passed`, and their next stream showing AUTH OK with no SCOPE line.
 
 ## Before the call (Claude)
 
